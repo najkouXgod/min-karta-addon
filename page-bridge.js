@@ -21,6 +21,7 @@
    */
   const featureIds = new WeakMap();
   const featuresById = new Map();
+  const featureLayers = new WeakMap();
   const originalHighlightStates = new WeakMap();
   const highlightedFeatures = new Map();
 
@@ -323,7 +324,7 @@
       for (const feature of features) {
         const geometry = feature.getGeometry?.();
         const type = geometry?.getType?.();
-
+        featureLayers.set(feature, layer);
         if (
           type !== "LineString" &&
           type !== "MultiLineString"
@@ -391,78 +392,115 @@
     };
   }
 
-  function createHighlightPropertyStyle(style) {
-    const baseStyle =
-      style &&
-      typeof style === "object" &&
-      !Array.isArray(style)
-        ? { ...style }
-        : {};
+  function getRenderedFeatureStyle(feature) {
+  const resolution =
+    cachedMap
+      ?.getView?.()
+      ?.getResolution?.();
 
-    return {
-      ...baseStyle,
-      strokeColor: HIGHLIGHT_COLOR,
-      strokeWidth: Math.max(
-        HIGHLIGHT_WIDTH,
-        Number(baseStyle.strokeWidth) || 0
-      ),
-      pointRadius: Math.max(
-        6,
-        Number(baseStyle.pointRadius) || 0
-      )
-    };
+  const directStyle =
+    feature.getStyle?.();
+
+  if (typeof directStyle === "function") {
+    return directStyle(feature, resolution);
   }
 
-  function cloneOpenLayersStyle(style) {
-    if (Array.isArray(style)) {
-      const clonedStyles = style
-        .map(cloneOpenLayersStyle)
-        .filter(Boolean);
+  if (directStyle) {
+    return directStyle;
+  }
 
-      return clonedStyles.length > 0
-        ? clonedStyles
-        : null;
-    }
+  const layer =
+    featureLayers.get(feature);
 
+  const layerStyleFunction =
+    layer?.getStyleFunction?.();
+
+  if (
+    typeof layerStyleFunction === "function"
+  ) {
+    return layerStyleFunction(
+      feature,
+      resolution
+    );
+  }
+
+  return null;
+}
+
+function cloneOpenLayersStyle(style) {
+  const sourceStyles =
+    Array.isArray(style)
+      ? style
+      : [style];
+
+  const outlineStyles = [];
+  const originalStyles = [];
+
+  for (const sourceStyle of sourceStyles) {
     if (
-      !style ||
-      typeof style === "function" ||
-      typeof style.clone !== "function"
+      !sourceStyle ||
+      typeof sourceStyle.clone !== "function"
     ) {
-      return null;
+      continue;
     }
 
-    const clonedStyle = style.clone();
-    const stroke = clonedStyle.getStroke?.();
+    const innerStyle =
+      sourceStyle.clone();
 
-    if (stroke) {
-      const clonedStroke =
-        typeof stroke.clone === "function"
-          ? stroke.clone()
-          : stroke;
+    const sourceStroke =
+      sourceStyle.getStroke?.();
 
-      clonedStroke.setColor?.(
+    if (sourceStroke) {
+      const outlineStyle =
+        sourceStyle.clone();
+
+      const outlineStroke =
+        typeof sourceStroke.clone === "function"
+          ? sourceStroke.clone()
+          : sourceStroke;
+
+      const originalWidth =
+        Number(
+          sourceStroke.getWidth?.()
+        ) || 2;
+
+      outlineStroke.setColor?.(
         HIGHLIGHT_COLOR
       );
-      clonedStroke.setWidth?.(
-        Math.max(
-          HIGHLIGHT_WIDTH,
-          Number(clonedStroke.getWidth?.()) || 0
-        )
+
+      outlineStroke.setWidth?.(
+        originalWidth + 5
       );
 
-      if (
-        clonedStroke !== stroke &&
-        typeof clonedStyle.setStroke === "function"
-      ) {
-        clonedStyle.setStroke(clonedStroke);
-      }
+      outlineStyle.setStroke?.(
+        outlineStroke
+      );
+
+      // Cyanmarkeringen ska bara vara en linje.
+      outlineStyle.setFill?.(null);
+      outlineStyle.setImage?.(null);
+      outlineStyle.setText?.(null);
+      outlineStyle.setZIndex?.(9_999);
+
+      outlineStyles.push(
+        outlineStyle
+      );
     }
 
-    clonedStyle.setZIndex?.(10_000);
-
-    return clonedStyle;
+    // Originallinjen ritas ovanpå den cyan kanten.
+    innerStyle.setZIndex?.(10_000);
+    originalStyles.push(innerStyle);
   }
+
+  const styles = [
+    ...outlineStyles,
+    ...originalStyles
+  ];
+
+  return styles.length > 0
+    ? styles
+    : null;
+}
 
   function applyFeatureHighlight(
     featureId,
@@ -492,17 +530,11 @@
       }
     );
 
-    if (typeof feature.set === "function") {
-      feature.set(
-        "style",
-        createHighlightPropertyStyle(
-          styleProperty.value
-        )
-      );
-    }
+    const renderedStyle =
+  getRenderedFeatureStyle(feature);
 
-    const highlightedDirectStyle =
-      cloneOpenLayersStyle(directStyle);
+const highlightedDirectStyle =
+  cloneOpenLayersStyle(renderedStyle);
 
     if (
       highlightedDirectStyle &&
