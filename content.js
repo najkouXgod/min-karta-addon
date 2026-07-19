@@ -8,6 +8,9 @@
   let lines = [];
   const selectedLineIds = new Set();
   let requestCounter = 0;
+  let activeElevationRequestId = null;
+  let pendingExportLines = [];
+  let elevationTimeoutId = null;
 
   // Undvik att skapa panelen flera gånger.
   if (document.getElementById(PANEL_ID)) {
@@ -145,7 +148,19 @@
             handleLinesFound(result);
             break;
 
+          case "ELEVATION_FOUND":
+            handleElevationFound(result);
+            break;
+
           case "ERROR":
+            if (
+              activeElevationRequestId &&
+              result.requestId ===
+                activeElevationRequestId
+            ) {
+              finishElevationRequest();
+            }
+
             setStatus(
               result.message ||
                 "Ett okänt fel inträffade.",
@@ -389,6 +404,10 @@
   }
 
   function exportSelectedLines() {
+    if (activeElevationRequestId) {
+      return;
+    }
+
     const selectedLines = lines.filter(line =>
       selectedLineIds.has(line.id)
     );
@@ -402,28 +421,122 @@
       return;
     }
 
+    pendingExportLines = selectedLines.map(
+      line => ({
+        id: line.id,
+        name: line.name
+      })
+    );
+
+    setExportBusy(true);
+    setStatus(
+      selectedLines.length === 1
+        ? "Hämtar höjddata..."
+        : `Hämtar höjddata för ${selectedLines.length} linjer...`
+    );
+
+    activeElevationRequestId = sendCommand(
+      "GET_ELEVATION",
+      {
+        lineIds: selectedLines.map(
+          line => line.id
+        )
+      }
+    );
+
+    elevationTimeoutId = window.setTimeout(
+      () => {
+        if (!activeElevationRequestId) {
+          return;
+        }
+
+        finishElevationRequest();
+        setStatus(
+          "Höjdhämtningen tog för lång tid. Försök igen.",
+          true
+        );
+      },
+      60_000
+    );
+  }
+
+  function handleElevationFound(result) {
+    if (
+      !activeElevationRequestId ||
+      result.requestId !==
+        activeElevationRequestId
+    ) {
+      return;
+    }
+
     try {
-      const gpx = createGpx(selectedLines);
+      if (
+        result.projection &&
+        result.projection !== "EPSG:3006"
+      ) {
+        throw new Error(
+          `Oväntad kartprojektion: ${result.projection}`
+        );
+      }
+
+      const elevationLines =
+        Array.isArray(result.lines)
+          ? result.lines
+          : [];
+
+      if (elevationLines.length === 0) {
+        throw new Error(
+          "Höjdtjänsten returnerade inga linjer."
+        );
+      }
+
+      const namesById = new Map(
+        pendingExportLines.map(line => [
+          line.id,
+          line.name
+        ])
+      );
+
+      const exportLines = elevationLines.map(
+        (line, index) => ({
+          ...line,
+          name:
+            namesById.get(line.id) ||
+            line.name ||
+            `Linje ${index + 1}`
+        })
+      );
+
+      const gpx = createGpx(exportLines);
 
       const filename =
-        selectedLines.length === 1
+        exportLines.length === 1
           ? createFilename(
-              selectedLines[0].name
+              exportLines[0].name
             )
           : "min-karta-rutter.gpx";
 
       downloadTextFile(gpx, filename);
 
-      if (selectedLines.length === 1) {
+      const elevationPointCount =
+        exportLines.reduce(
+          (total, line) =>
+            total +
+            (Number(line.pointCount) || 0),
+          0
+        );
+
+      if (exportLines.length === 1) {
         setStatus(
           `Exporterade ${
-            selectedLines[0].name ||
+            exportLines[0].name ||
             "vald linje"
-          }.`
+          } med ${elevationPointCount} höjdpunkter.`
         );
       } else {
         setStatus(
-          `Exporterade ${selectedLines.length} linjer.`
+          `Exporterade ${exportLines.length} linjer med ` +
+          `${elevationPointCount} höjdpunkter.`
         );
       }
     } catch (error) {
@@ -438,7 +551,52 @@
           : "Kunde inte skapa GPX-filen.",
         true
       );
+    } finally {
+      finishElevationRequest();
     }
+  }
+
+  function finishElevationRequest() {
+    if (elevationTimeoutId !== null) {
+      window.clearTimeout(
+        elevationTimeoutId
+      );
+      elevationTimeoutId = null;
+    }
+
+    activeElevationRequestId = null;
+    pendingExportLines = [];
+    setExportBusy(false);
+  }
+
+  function setExportBusy(isBusy) {
+    const exportButton =
+      document.getElementById("mkgpx-export");
+
+    const refreshButton =
+      document.getElementById("mkgpx-refresh");
+
+    if (exportButton) {
+      exportButton.textContent = isBusy
+        ? "Hämtar höjd..."
+        : "Exportera valda";
+
+      exportButton.disabled =
+        isBusy ||
+        selectedLineIds.size === 0;
+    }
+
+    if (refreshButton) {
+      refreshButton.disabled = isBusy;
+    }
+
+    document
+      .querySelectorAll(
+        "#mkgpx-lines input[type=\"checkbox\"]"
+      )
+      .forEach(checkbox => {
+        checkbox.disabled = isBusy;
+      });
   }
 
   function createGpx(selectedLines) {
@@ -453,10 +611,13 @@
 
     const tracks = selectedLines
       .map((line, lineIndex) => {
-        const segments = normalizeSegments(
-          line.type,
-          line.coordinates
-        );
+        const segments =
+          Array.isArray(line.segments)
+            ? line.segments
+            : normalizeSegments(
+                line.type,
+                line.coordinates
+              );
 
         if (segments.length === 0) {
           return "";
@@ -493,6 +654,21 @@
                   easting,
                   northing
                 );
+
+                const elevation =
+                  coordinate.length >= 3 &&
+                  coordinate[2] !== null
+                    ? Number(coordinate[2])
+                    : null;
+
+                if (Number.isFinite(elevation)) {
+                  return (
+                    `      <trkpt lat="${latitude.toFixed(7)}"` +
+                    ` lon="${longitude.toFixed(7)}">\n` +
+                    `        <ele>${elevation.toFixed(2)}</ele>\n` +
+                    "      </trkpt>"
+                  );
+                }
 
                 return (
                   `      <trkpt lat="${latitude.toFixed(7)}"` +
