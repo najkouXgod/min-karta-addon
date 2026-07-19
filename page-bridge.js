@@ -10,6 +10,8 @@
 
   const COMMAND_EVENT = "MINKARTA_GPX_COMMAND";
   const RESULT_EVENT = "MINKARTA_GPX_RESULT";
+  const ELEVATION_URL =
+    "/api/hojdprofil/hojdprofil/v1";
 
   let cachedMap = null;
 
@@ -368,6 +370,255 @@
     return lines;
   }
 
+  function getLineSegments(type, coordinates) {
+    if (type === "LineString") {
+      return [coordinates];
+    }
+
+    if (type === "MultiLineString") {
+      return coordinates.filter(
+        segment =>
+          Array.isArray(segment) &&
+          segment.length >= 2
+      );
+    }
+
+    return [];
+  }
+
+  function createElevationRequest(coordinates) {
+    return {
+      measureFeatures: {
+        type: "FeatureCollection",
+        features: [
+          {
+            type: "Feature",
+            geometry: {
+              type: "LineString",
+              coordinates:
+                copyCoordinates(coordinates)
+            },
+            properties: {
+              measure: true,
+              length:
+                calculateSegmentLength(
+                  coordinates
+                )
+            }
+          }
+        ]
+      }
+    };
+  }
+
+  function normalizeElevationCoordinates(
+    coordinates,
+    noDataValue
+  ) {
+    if (!Array.isArray(coordinates)) {
+      throw new Error(
+        "Höjdtjänsten returnerade inga koordinater."
+      );
+    }
+
+    return coordinates.map(coordinate => {
+      if (
+        !Array.isArray(coordinate) ||
+        coordinate.length < 3
+      ) {
+        throw new Error(
+          "Höjdtjänsten returnerade en ogiltig punkt."
+        );
+      }
+
+      const easting = Number(coordinate[0]);
+      const northing = Number(coordinate[1]);
+      const rawElevation = Number(coordinate[2]);
+
+      if (
+        !Number.isFinite(easting) ||
+        !Number.isFinite(northing)
+      ) {
+        throw new Error(
+          "Höjdtjänsten returnerade ogiltiga kartkoordinater."
+        );
+      }
+
+      const elevation =
+        Number.isFinite(rawElevation) &&
+        rawElevation !== noDataValue
+          ? rawElevation
+          : null;
+
+      return [
+        easting,
+        northing,
+        elevation
+      ];
+    });
+  }
+
+  async function fetchElevationForSegment(
+    coordinates
+  ) {
+    if (
+      !Array.isArray(coordinates) ||
+      coordinates.length < 2
+    ) {
+      throw new Error(
+        "Linjen måste innehålla minst två punkter."
+      );
+    }
+
+    const response = await fetch(
+      ELEVATION_URL,
+      {
+        method: "POST",
+        headers: {
+          Accept:
+            "application/json, text/plain, */*",
+          "Content-Type": "application/json"
+        },
+        credentials: "include",
+        body: JSON.stringify(
+          createElevationRequest(coordinates)
+        )
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Höjdtjänsten svarade med ${response.status}.`
+      );
+    }
+
+    const result = await response.json();
+    const geometry = result?.geometry;
+
+    if (
+      geometry?.type !== "LineString" ||
+      !Array.isArray(geometry.coordinates)
+    ) {
+      throw new Error(
+        "Höjdtjänsten returnerade ett oväntat svar."
+      );
+    }
+
+    const noDataValue = Number(
+      result?.properties?.nodatavalue
+    );
+
+    return {
+      coordinates:
+        normalizeElevationCoordinates(
+          geometry.coordinates,
+          Number.isFinite(noDataValue)
+            ? noDataValue
+            : -9999
+        ),
+      noDataValue:
+        Number.isFinite(noDataValue)
+          ? noDataValue
+          : -9999
+    };
+  }
+
+  async function getElevationForLines(
+    lineIds
+  ) {
+    if (
+      !Array.isArray(lineIds) ||
+      lineIds.length === 0
+    ) {
+      throw new Error(
+        "Inga linjer valdes för höjdhämtning."
+      );
+    }
+
+    const map = findMap();
+
+    /*
+     * Uppdatera feature-registret innan ID:n slås upp.
+     * Det hjälper om kartan har laddat om sina lager.
+     */
+    findDrawnLines(map);
+
+    const elevationLines = [];
+
+    for (const lineId of lineIds) {
+      const feature = featuresById.get(lineId);
+
+      if (!feature) {
+        throw new Error(
+          `Kunde inte hitta linjen ${String(lineId)}.`
+        );
+      }
+
+      const geometry = feature.getGeometry?.();
+      const type = geometry?.getType?.();
+      const rawCoordinates =
+        geometry?.getCoordinates?.();
+
+      if (!Array.isArray(rawCoordinates)) {
+        throw new Error(
+          `Linjen ${String(lineId)} saknar koordinater.`
+        );
+      }
+
+      const segments = getLineSegments(
+        type,
+        copyCoordinates(rawCoordinates)
+      );
+
+      if (segments.length === 0) {
+        throw new Error(
+          `Linjen ${String(lineId)} har en typ som inte stöds.`
+        );
+      }
+
+      const elevationSegments = [];
+
+      /*
+       * Kör delsträckorna i ordning. Det minskar risken
+       * att höjdtjänsten belastas med många parallella anrop.
+       */
+      for (const segment of segments) {
+        const elevationResult =
+          await fetchElevationForSegment(
+            segment
+          );
+
+        elevationSegments.push(
+          elevationResult.coordinates
+        );
+      }
+
+      elevationLines.push({
+        id: lineId,
+        name: getFeatureName(
+          feature,
+          String(lineId)
+        ),
+        type,
+        segments: elevationSegments,
+        pointCount: elevationSegments.reduce(
+          (total, segment) =>
+            total + segment.length,
+          0
+        )
+      });
+    }
+
+    return {
+      projection:
+        map
+          .getView?.()
+          .getProjection?.()
+          .getCode?.() ?? null,
+      lines: elevationLines
+    };
+  }
+
   function sendResult(payload) {
     /*
      * JSON-strängen gör kommunikationen mellan MAIN och
@@ -411,7 +662,7 @@
 
   window.addEventListener(
     COMMAND_EVENT,
-    event => {
+    async event => {
       let command;
 
       try {
@@ -450,6 +701,23 @@
                   .getProjection?.()
                   .getCode?.() ?? null,
               lines
+            });
+
+            break;
+          }
+
+          case "GET_ELEVATION": {
+            const elevationResult =
+              await getElevationForLines(
+                command.lineIds
+              );
+
+            sendResult({
+              action: "ELEVATION_FOUND",
+              requestId,
+              projection:
+                elevationResult.projection,
+              lines: elevationResult.lines
             });
 
             break;
