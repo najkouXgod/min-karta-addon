@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Min karta GPX",
+  "version": "0.1.0",
+  "description": "Importera och exportera GPX-filer i Lantmäteriets Min karta.",
+  "permissions": [
+    "storage"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://minkarta.lantmateriet.se/*"
+      ],
+      "js": [
+        "page-bridge.js"
+      ],
+      "run_at": "document_idle",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://minkarta.lantmateriet.se/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "css": [
+        "panel.css"
+      ],
+      "run_at": "document_idle",
+      "world": "ISOLATED"
+    }
+  ]
+}
