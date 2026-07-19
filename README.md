@@ -1,0 +1,1 @@
+# min-karta-addon
