@@ -7,10 +7,14 @@
 
   let lines = [];
   const selectedLineIds = new Set();
+  const lineSettings = new Map();
+
   let requestCounter = 0;
   let activeElevationRequestId = null;
   let pendingExportLines = [];
+  let pendingExportFilename = null;
   let elevationTimeoutId = null;
+  let lastSuggestedFilename = "min-karta-rutt.gpx";
 
   // Undvik att skapa panelen flera gånger.
   if (document.getElementById(PANEL_ID)) {
@@ -55,6 +59,17 @@
             id="mkgpx-lines"
             class="mkgpx-lines"
           ></div>
+
+          <label class="mkgpx-file-setting">
+            <span>GPX-filnamn</span>
+            <input
+              id="mkgpx-filename"
+              type="text"
+              value="min-karta-rutt.gpx"
+              spellcheck="false"
+              autocomplete="off"
+            >
+          </label>
 
           <div class="mkgpx-actions">
             <button
@@ -109,6 +124,15 @@
         "click",
         exportSelectedLines
       );
+
+    const filenameInput =
+      document.getElementById("mkgpx-filename");
+
+    filenameInput.addEventListener("blur", () => {
+      filenameInput.value = normalizeFilename(
+        filenameInput.value
+      );
+    });
   }
 
   function listenForResults() {
@@ -150,6 +174,9 @@
 
           case "ELEVATION_FOUND":
             handleElevationFound(result);
+            break;
+
+          case "HIGHLIGHTS_UPDATED":
             break;
 
           case "ERROR":
@@ -275,6 +302,9 @@
       selectedLineIds.clear();
       exportButton.disabled = true;
 
+      updateFilenameSuggestion(true);
+      syncHighlightedLines();
+
       setStatus(
         "Ingen ritad linje hittades. Rita en linje och tryck Uppdatera."
       );
@@ -283,10 +313,21 @@
     }
 
     lines.forEach((line, index) => {
-      const label =
-        document.createElement("label");
+      const settings = getLineSettings(
+        line,
+        index
+      );
 
-      label.className = "mkgpx-line";
+      const card =
+        document.createElement("div");
+
+      card.className = "mkgpx-line";
+      card.dataset.lineId = line.id;
+
+      const topRow =
+        document.createElement("div");
+
+      topRow.className = "mkgpx-line-top";
 
       const checkbox =
         document.createElement("input");
@@ -295,6 +336,10 @@
       checkbox.value = line.id;
       checkbox.checked =
         selectedLineIds.has(line.id);
+      checkbox.setAttribute(
+        "aria-label",
+        `Välj ${settings.name}`
+      );
 
       checkbox.addEventListener(
         "change",
@@ -309,37 +354,151 @@
             selectedLineIds.size === 0;
 
           updateSelectionStatus();
+          updateFilenameSuggestion();
+          syncHighlightedLines();
         }
       );
-
-      const information =
-        document.createElement("span");
-
-      information.className =
-        "mkgpx-line-information";
-
-      const name =
-        document.createElement("strong");
-
-      name.textContent =
-        line.name || `Linje ${index + 1}`;
 
       const details =
         document.createElement("small");
 
       details.textContent =
         `${formatLength(line.lengthMeters)} · ` +
-        `${line.pointCount} punkter`;
+        `${line.pointCount} ritpunkter`;
 
-      information.append(name, details);
-      label.append(checkbox, information);
-      container.appendChild(label);
+      topRow.append(checkbox, details);
+
+      const nameLabel =
+        document.createElement("label");
+
+      nameLabel.className =
+        "mkgpx-line-name";
+
+      const nameCaption =
+        document.createElement("span");
+
+      nameCaption.textContent = "Spårnamn";
+
+      const nameInput =
+        document.createElement("input");
+
+      nameInput.type = "text";
+      nameInput.value = settings.name;
+      nameInput.maxLength = 120;
+      nameInput.autocomplete = "off";
+      nameInput.spellcheck = false;
+
+      nameInput.addEventListener("input", () => {
+        settings.name =
+          nameInput.value.trimStart();
+
+        checkbox.setAttribute(
+          "aria-label",
+          `Välj ${
+            settings.name ||
+            `Linje ${index + 1}`
+          }`
+        );
+
+        updateFilenameSuggestion();
+      });
+
+      nameInput.addEventListener("blur", () => {
+        if (!settings.name.trim()) {
+          settings.name =
+            line.name || `Linje ${index + 1}`;
+          nameInput.value = settings.name;
+          updateFilenameSuggestion();
+        }
+      });
+
+      nameLabel.append(
+        nameCaption,
+        nameInput
+      );
+
+      card.append(topRow, nameLabel);
+      container.appendChild(card);
     });
 
     exportButton.disabled =
       selectedLineIds.size === 0;
 
     updateSelectionStatus();
+    updateFilenameSuggestion();
+    syncHighlightedLines();
+  }
+
+  function getLineSettings(line, index) {
+    if (!lineSettings.has(line.id)) {
+      lineSettings.set(line.id, {
+        name:
+          line.name || `Linje ${index + 1}`
+      });
+    }
+
+    return lineSettings.get(line.id);
+  }
+
+  function getEditedLineName(line, index) {
+    const settings = getLineSettings(
+      line,
+      index
+    );
+
+    return (
+      settings.name.trim() ||
+      line.name ||
+      `Linje ${index + 1}`
+    );
+  }
+
+  function updateFilenameSuggestion(force = false) {
+    const filenameInput =
+      document.getElementById("mkgpx-filename");
+
+    if (!filenameInput) {
+      return;
+    }
+
+    const selectedLines = lines.filter(line =>
+      selectedLineIds.has(line.id)
+    );
+
+    let suggestion = "min-karta-rutt.gpx";
+
+    if (selectedLines.length === 1) {
+      const line = selectedLines[0];
+      const index = lines.indexOf(line);
+
+      suggestion = createFilename(
+        getEditedLineName(line, index)
+      );
+    } else if (selectedLines.length > 1) {
+      suggestion = "min-karta-rutter.gpx";
+    }
+
+    const currentValue =
+      filenameInput.value.trim();
+
+    if (
+      force ||
+      !currentValue ||
+      currentValue === lastSuggestedFilename
+    ) {
+      filenameInput.value = suggestion;
+    }
+
+    lastSuggestedFilename = suggestion;
+  }
+
+  function syncHighlightedLines() {
+    sendCommand(
+      "SET_HIGHLIGHTED_LINES",
+      {
+        lineIds: [...selectedLineIds]
+      }
+    );
   }
 
   function updateSelectionStatus() {
@@ -422,10 +581,29 @@
     }
 
     pendingExportLines = selectedLines.map(
-      line => ({
-        id: line.id,
-        name: line.name
-      })
+      line => {
+        const index = lines.indexOf(line);
+
+        return {
+          id: line.id,
+          name: getEditedLineName(
+            line,
+            index
+          )
+        };
+      }
+    );
+
+    const filenameInput =
+      document.getElementById("mkgpx-filename");
+
+    pendingExportFilename = normalizeFilename(
+      filenameInput?.value ||
+        (selectedLines.length === 1
+          ? createFilename(
+              pendingExportLines[0].name
+            )
+          : "min-karta-rutter.gpx")
     );
 
     setExportBusy(true);
@@ -510,11 +688,12 @@
       const gpx = createGpx(exportLines);
 
       const filename =
-        exportLines.length === 1
+        pendingExportFilename ||
+        (exportLines.length === 1
           ? createFilename(
               exportLines[0].name
             )
-          : "min-karta-rutter.gpx";
+          : "min-karta-rutter.gpx");
 
       downloadTextFile(gpx, filename);
 
@@ -566,6 +745,7 @@
 
     activeElevationRequestId = null;
     pendingExportLines = [];
+    pendingExportFilename = null;
     setExportBusy(false);
   }
 
@@ -769,6 +949,26 @@ ${tracks}
     return `${
       safeName || "min-karta-rutt"
     }.gpx`;
+  }
+
+  function normalizeFilename(value) {
+    let filename = String(
+      value || "min-karta-rutt.gpx"
+    )
+      .trim()
+      .replace(/[\/:*?"<>|]+/g, "-")
+      .replace(/\s+/g, " ")
+      .replace(/[. ]+$/g, "");
+
+    if (!filename) {
+      filename = "min-karta-rutt.gpx";
+    }
+
+    if (!/\.gpx$/i.test(filename)) {
+      filename += ".gpx";
+    }
+
+    return filename;
   }
 
   function downloadTextFile(

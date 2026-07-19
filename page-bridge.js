@@ -21,6 +21,11 @@
    */
   const featureIds = new WeakMap();
   const featuresById = new Map();
+  const originalHighlightStates = new WeakMap();
+  const highlightedFeatures = new Map();
+
+  const HIGHLIGHT_COLOR = "#00e5ff";
+  const HIGHLIGHT_WIDTH = 7;
 
   let nextFeatureId = 1;
 
@@ -368,6 +373,230 @@
     });
 
     return lines;
+  }
+
+  function getOwnFeatureProperty(
+    feature,
+    propertyName
+  ) {
+    const properties =
+      feature.getProperties?.() ?? {};
+
+    return {
+      exists: Object.prototype.hasOwnProperty.call(
+        properties,
+        propertyName
+      ),
+      value: properties[propertyName]
+    };
+  }
+
+  function createHighlightPropertyStyle(style) {
+    const baseStyle =
+      style &&
+      typeof style === "object" &&
+      !Array.isArray(style)
+        ? { ...style }
+        : {};
+
+    return {
+      ...baseStyle,
+      strokeColor: HIGHLIGHT_COLOR,
+      strokeWidth: Math.max(
+        HIGHLIGHT_WIDTH,
+        Number(baseStyle.strokeWidth) || 0
+      ),
+      pointRadius: Math.max(
+        6,
+        Number(baseStyle.pointRadius) || 0
+      )
+    };
+  }
+
+  function cloneOpenLayersStyle(style) {
+    if (Array.isArray(style)) {
+      const clonedStyles = style
+        .map(cloneOpenLayersStyle)
+        .filter(Boolean);
+
+      return clonedStyles.length > 0
+        ? clonedStyles
+        : null;
+    }
+
+    if (
+      !style ||
+      typeof style === "function" ||
+      typeof style.clone !== "function"
+    ) {
+      return null;
+    }
+
+    const clonedStyle = style.clone();
+    const stroke = clonedStyle.getStroke?.();
+
+    if (stroke) {
+      const clonedStroke =
+        typeof stroke.clone === "function"
+          ? stroke.clone()
+          : stroke;
+
+      clonedStroke.setColor?.(
+        HIGHLIGHT_COLOR
+      );
+      clonedStroke.setWidth?.(
+        Math.max(
+          HIGHLIGHT_WIDTH,
+          Number(clonedStroke.getWidth?.()) || 0
+        )
+      );
+
+      if (
+        clonedStroke !== stroke &&
+        typeof clonedStyle.setStroke === "function"
+      ) {
+        clonedStyle.setStroke(clonedStroke);
+      }
+    }
+
+    clonedStyle.setZIndex?.(10_000);
+
+    return clonedStyle;
+  }
+
+  function applyFeatureHighlight(
+    featureId,
+    feature
+  ) {
+    if (!feature || highlightedFeatures.has(featureId)) {
+      return;
+    }
+
+    const styleProperty =
+      getOwnFeatureProperty(
+        feature,
+        "style"
+      );
+
+    const directStyle =
+      feature.getStyle?.();
+
+    originalHighlightStates.set(
+      feature,
+      {
+        stylePropertyExists:
+          styleProperty.exists,
+        stylePropertyValue:
+          styleProperty.value,
+        directStyle
+      }
+    );
+
+    if (typeof feature.set === "function") {
+      feature.set(
+        "style",
+        createHighlightPropertyStyle(
+          styleProperty.value
+        )
+      );
+    }
+
+    const highlightedDirectStyle =
+      cloneOpenLayersStyle(directStyle);
+
+    if (
+      highlightedDirectStyle &&
+      typeof feature.setStyle === "function"
+    ) {
+      feature.setStyle(
+        highlightedDirectStyle
+      );
+    }
+
+    feature.changed?.();
+    highlightedFeatures.set(
+      featureId,
+      feature
+    );
+  }
+
+  function restoreFeatureHighlight(
+    featureId,
+    feature
+  ) {
+    const state =
+      originalHighlightStates.get(feature);
+
+    if (state) {
+      if (typeof feature.setStyle === "function") {
+        feature.setStyle(state.directStyle);
+      }
+
+      if (state.stylePropertyExists) {
+        feature.set?.(
+          "style",
+          state.stylePropertyValue
+        );
+      } else {
+        feature.unset?.("style");
+      }
+
+      originalHighlightStates.delete(feature);
+    }
+
+    feature.changed?.();
+    highlightedFeatures.delete(featureId);
+  }
+
+  function setHighlightedLines(lineIds) {
+    const map = findMap();
+
+    // Uppdatera feature-registret innan ID:n används.
+    findDrawnLines(map);
+
+    const requestedIds = new Set(
+      Array.isArray(lineIds)
+        ? lineIds.map(String)
+        : []
+    );
+
+    for (
+      const [featureId, feature] of
+      [...highlightedFeatures.entries()]
+    ) {
+      if (!requestedIds.has(featureId)) {
+        restoreFeatureHighlight(
+          featureId,
+          feature
+        );
+      }
+    }
+
+    for (const featureId of requestedIds) {
+      const feature =
+        featuresById.get(featureId);
+
+      if (feature) {
+        applyFeatureHighlight(
+          featureId,
+          feature
+        );
+      }
+    }
+
+    map.render?.();
+
+    return {
+      projection:
+        map
+          .getView?.()
+          .getProjection?.()
+          .getCode?.() ?? null,
+      lineIds: [...requestedIds].filter(
+        featureId =>
+          highlightedFeatures.has(featureId)
+      )
+    };
   }
 
   function getLineSegments(type, coordinates) {
@@ -718,6 +947,23 @@
               projection:
                 elevationResult.projection,
               lines: elevationResult.lines
+            });
+
+            break;
+          }
+
+          case "SET_HIGHLIGHTED_LINES": {
+            const highlightResult =
+              setHighlightedLines(
+                command.lineIds
+              );
+
+            sendResult({
+              action: "HIGHLIGHTS_UPDATED",
+              requestId,
+              projection:
+                highlightResult.projection,
+              lineIds: highlightResult.lineIds
             });
 
             break;
