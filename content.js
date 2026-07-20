@@ -182,18 +182,19 @@
           case "ERROR":
             if (
               activeElevationRequestId &&
-              result.requestId ===
-                activeElevationRequestId
+              result.requestId === activeElevationRequestId
             ) {
-              finishElevationRequest();
-            }
-
-            setStatus(
-              result.message ||
-                "Ett okänt fel inträffade.",
-              true
-            );
+              offerExportWithoutElevation(
+                result.message || "Kunde inte hämta höjddata."
+              );
             break;
+  }
+
+  setStatus(
+    result.message || "Ett okänt fel inträffade.",
+    true
+  );
+  break;
 
           case "PONG":
             console.log(
@@ -585,12 +586,14 @@
         const index = lines.indexOf(line);
 
         return {
-          id: line.id,
-          name: getEditedLineName(
-            line,
-            index
-          )
-        };
+  id: line.id,
+  name: getEditedLineName(
+    line,
+    index
+  ),
+  type: line.type,
+  coordinates: line.coordinates
+};
       }
     );
 
@@ -628,11 +631,9 @@
           return;
         }
 
-        finishElevationRequest();
-        setStatus(
-          "Höjdhämtningen tog för lång tid. Försök igen.",
-          true
-        );
+        offerExportWithoutElevation(
+        "Höjdhämtningen tog för lång tid."
+      );
       },
       60_000
     );
@@ -718,22 +719,95 @@
           `${elevationPointCount} höjdpunkter.`
         );
       }
-    } catch (error) {
-      console.error(
-        "[Min karta GPX]",
-        error
-      );
+} catch (error) {
+  console.error(
+    "[Min karta GPX]",
+    error
+  );
 
-      setStatus(
-        error instanceof Error
-          ? error.message
-          : "Kunde inte skapa GPX-filen.",
-        true
-      );
-    } finally {
-      finishElevationRequest();
-    }
+  offerExportWithoutElevation(
+    error instanceof Error
+      ? error.message
+      : "Kunde inte använda höjddatan."
+  );
+} finally {
+  finishElevationRequest();
+}
   }
+
+  function offerExportWithoutElevation(errorMessage) {
+  /*
+   * Kopiera informationen innan finishElevationRequest()
+   * tömmer pendingExportLines.
+   */
+  const exportLines = pendingExportLines.map(
+    (line, index) => ({
+      id: line.id,
+      name: line.name || `Linje ${index + 1}`,
+      type: line.type,
+      coordinates: line.coordinates
+    })
+  );
+
+  const filename =
+    pendingExportFilename ||
+    (exportLines.length === 1
+      ? createFilename(exportLines[0].name)
+      : "min-karta-rutter.gpx");
+
+  finishElevationRequest();
+
+  if (exportLines.length === 0) {
+    setStatus(
+      errorMessage || "Kunde inte hämta höjddata.",
+      true
+    );
+    return;
+  }
+
+  const shouldExport = window.confirm(
+    `${errorMessage || "Kunde inte hämta höjddata."}` +
+    "\n\nVill du exportera GPX-filen utan höjddata?"
+  );
+
+  if (!shouldExport) {
+    setStatus("Exporten avbröts.");
+    return;
+  }
+
+  try {
+    const gpx = createGpx(exportLines);
+
+    downloadTextFile(
+      gpx,
+      filename
+    );
+
+    if (exportLines.length === 1) {
+      setStatus(
+        `Exporterade ${
+          exportLines[0].name || "vald linje"
+        } utan höjddata.`
+      );
+    } else {
+      setStatus(
+        `Exporterade ${exportLines.length} linjer utan höjddata.`
+      );
+    }
+  } catch (error) {
+    console.error(
+      "[Min karta GPX]",
+      error
+    );
+
+    setStatus(
+      error instanceof Error
+        ? error.message
+        : "Kunde inte skapa GPX-filen.",
+      true
+    );
+  }
+}
 
   function finishElevationRequest() {
     if (elevationTimeoutId !== null) {
