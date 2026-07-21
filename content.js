@@ -180,14 +180,21 @@
             break;
 
           case "ERROR":
-            if (
-              activeElevationRequestId &&
-              result.requestId === activeElevationRequestId
-            ) {
-              offerExportWithoutElevation(
-                result.message || "Kunde inte hämta höjddata."
-              );
-            break;
+  if (
+    activeElevationRequestId &&
+    result.requestId === activeElevationRequestId
+  ) {
+    offerExportWithoutElevation(
+      result.message || "Kunde inte hämta höjddata."
+    );
+    break;
+  }
+
+  setStatus(
+    result.message || "Ett okänt fel inträffade.",
+    true
+  );
+  break;
   }
 
   setStatus(
