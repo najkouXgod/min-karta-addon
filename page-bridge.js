@@ -719,6 +719,192 @@ const highlightedDirectStyle =
     });
   }
 
+    const ELEVATION_CHUNK_LENGTH_METERS = 50_000;
+  const MIN_RETRY_CHUNK_LENGTH_METERS = 2_000;
+  const COORDINATE_MATCH_TOLERANCE_METERS = 0.5;
+
+  function interpolateCoordinate(
+    start,
+    end,
+    fraction
+  ) {
+    return [
+      Number(start[0]) +
+        (Number(end[0]) - Number(start[0])) * fraction,
+      Number(start[1]) +
+        (Number(end[1]) - Number(start[1])) * fraction
+    ];
+  }
+
+  function splitSegmentByLength(
+    coordinates,
+    maxLengthMeters = ELEVATION_CHUNK_LENGTH_METERS
+  ) {
+    if (
+      !Array.isArray(coordinates) ||
+      coordinates.length < 2
+    ) {
+      throw new Error(
+        "Linjen måste innehålla minst två punkter."
+      );
+    }
+
+    if (
+      !Number.isFinite(maxLengthMeters) ||
+      maxLengthMeters <= 0
+    ) {
+      throw new Error(
+        "Ogiltig maxlängd för höjddelar."
+      );
+    }
+
+    const chunks = [];
+    const epsilon = 0.001;
+
+    let currentChunk = [
+      copyCoordinates(coordinates[0])
+    ];
+
+    let currentChunkLength = 0;
+
+    for (
+      let index = 1;
+      index < coordinates.length;
+      index++
+    ) {
+      let edgeStart =
+        copyCoordinates(coordinates[index - 1]);
+
+      const edgeEnd =
+        copyCoordinates(coordinates[index]);
+
+      let remainingEdgeLength = Math.hypot(
+        Number(edgeEnd[0]) - Number(edgeStart[0]),
+        Number(edgeEnd[1]) - Number(edgeStart[1])
+      );
+
+      if (!Number.isFinite(remainingEdgeLength)) {
+        throw new Error(
+          "Linjen innehåller ogiltiga koordinater."
+        );
+      }
+
+      if (remainingEdgeLength <= epsilon) {
+        currentChunk.push(edgeEnd);
+        continue;
+      }
+
+      while (remainingEdgeLength > epsilon) {
+        const remainingChunkLength =
+          maxLengthMeters - currentChunkLength;
+
+        if (remainingChunkLength <= epsilon) {
+          if (currentChunk.length >= 2) {
+            chunks.push(currentChunk);
+          }
+
+          currentChunk = [
+            copyCoordinates(edgeStart)
+          ];
+
+          currentChunkLength = 0;
+          continue;
+        }
+
+        if (
+          remainingEdgeLength <=
+          remainingChunkLength + epsilon
+        ) {
+          currentChunk.push(edgeEnd);
+          currentChunkLength += remainingEdgeLength;
+          remainingEdgeLength = 0;
+          continue;
+        }
+
+        const fraction =
+          remainingChunkLength /
+          remainingEdgeLength;
+
+        const splitPoint = interpolateCoordinate(
+          edgeStart,
+          edgeEnd,
+          fraction
+        );
+
+        currentChunk.push(splitPoint);
+        chunks.push(currentChunk);
+
+        currentChunk = [
+          copyCoordinates(splitPoint)
+        ];
+
+        currentChunkLength = 0;
+        edgeStart = splitPoint;
+
+        remainingEdgeLength = Math.hypot(
+          Number(edgeEnd[0]) - Number(edgeStart[0]),
+          Number(edgeEnd[1]) - Number(edgeStart[1])
+        );
+      }
+    }
+
+    if (currentChunk.length >= 2) {
+      chunks.push(currentChunk);
+    }
+
+    return chunks;
+  }
+
+  function coordinatesMatch(
+    first,
+    second,
+    toleranceMeters =
+      COORDINATE_MATCH_TOLERANCE_METERS
+  ) {
+    if (
+      !Array.isArray(first) ||
+      !Array.isArray(second) ||
+      first.length < 2 ||
+      second.length < 2
+    ) {
+      return false;
+    }
+
+    return (
+      Math.hypot(
+        Number(first[0]) - Number(second[0]),
+        Number(first[1]) - Number(second[1])
+      ) <= toleranceMeters
+    );
+  }
+
+  function mergeElevationCoordinates(
+    target,
+    source
+  ) {
+    if (
+      !Array.isArray(source) ||
+      source.length === 0
+    ) {
+      return target;
+    }
+
+    if (target.length === 0) {
+      target.push(...source);
+      return target;
+    }
+
+    const startIndex = coordinatesMatch(
+      target[target.length - 1],
+      source[0]
+    )
+      ? 1
+      : 0;
+
+    target.push(...source.slice(startIndex));
+    return target;
+  }
+
   async function fetchElevationForSegment(
     coordinates
   ) {
@@ -748,9 +934,12 @@ const highlightedDirectStyle =
     );
 
     if (!response.ok) {
-      throw new Error(
+      const error = new Error(
         `Höjdtjänsten svarade med ${response.status}.`
       );
+
+      error.status = response.status;
+      throw error;
     }
 
     const result = await response.json();
@@ -770,17 +959,79 @@ const highlightedDirectStyle =
     );
 
     return {
-      coordinates:
-        normalizeElevationCoordinates(
-          geometry.coordinates,
-          Number.isFinite(noDataValue)
-            ? noDataValue
-            : -9999
-        ),
-      noDataValue:
+      coordinates: normalizeElevationCoordinates(
+        geometry.coordinates,
         Number.isFinite(noDataValue)
           ? noDataValue
           : -9999
+      ),
+      noDataValue: Number.isFinite(noDataValue)
+        ? noDataValue
+        : -9999
+    };
+  }
+
+  async function fetchElevationForChunk(
+    coordinates
+  ) {
+    try {
+      return await fetchElevationForSegment(
+        coordinates
+      );
+    } catch (error) {
+      const segmentLength =
+        calculateSegmentLength(coordinates);
+
+      const shouldRetrySmaller =
+        error?.status === 422 &&
+        segmentLength >
+          MIN_RETRY_CHUNK_LENGTH_METERS;
+
+      if (!shouldRetrySmaller) {
+        throw error;
+      }
+
+      const retryMaxLength = Math.max(
+        MIN_RETRY_CHUNK_LENGTH_METERS,
+        segmentLength / 2
+      );
+
+      const retryChunks = splitSegmentByLength(
+        coordinates,
+        retryMaxLength
+      );
+
+      if (retryChunks.length <= 1) {
+        throw error;
+      }
+
+      return fetchAndMergeElevationChunks(
+        retryChunks
+      );
+    }
+  }
+
+  async function fetchAndMergeElevationChunks(
+    chunks
+  ) {
+    const mergedCoordinates = [];
+    let noDataValue = -9999;
+
+    for (const chunk of chunks) {
+      const elevationResult =
+        await fetchElevationForChunk(chunk);
+
+      noDataValue = elevationResult.noDataValue;
+
+      mergeElevationCoordinates(
+        mergedCoordinates,
+        elevationResult.coordinates
+      );
+    }
+
+    return {
+      coordinates: mergedCoordinates,
+      noDataValue
     };
   }
 
@@ -840,13 +1091,18 @@ const highlightedDirectStyle =
       const elevationSegments = [];
 
       /*
-       * Kör delsträckorna i ordning. Det minskar risken
-       * att höjdtjänsten belastas med många parallella anrop.
+       * Varje ursprunglig delsträcka delas i delar på högst
+       * 50 km. Anropen körs i ordning och slås sedan ihop
+       * till samma sammanhängande GPX-segment.
        */
       for (const segment of segments) {
+        const chunks = splitSegmentByLength(
+          segment
+        );
+
         const elevationResult =
-          await fetchElevationForSegment(
-            segment
+          await fetchAndMergeElevationChunks(
+            chunks
           );
 
         elevationSegments.push(
@@ -879,6 +1135,7 @@ const highlightedDirectStyle =
       lines: elevationLines
     };
   }
+
 
   function sendResult(payload) {
     /*

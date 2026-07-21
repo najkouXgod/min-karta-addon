@@ -202,8 +202,8 @@
     );
     break;
         }
-  }
-);
+      }
+    );
   }
 
   function sendCommand(action, extraData = {}) {
@@ -625,6 +625,25 @@
       }
     );
 
+    const totalLengthMeters = selectedLines.reduce(
+      (total, line) =>
+        total + (Number(line.lengthMeters) || 0),
+      0
+    );
+
+    const estimatedElevationRequests = Math.max(
+      1,
+      Math.ceil(totalLengthMeters / 50_000)
+    );
+
+    const elevationTimeoutMilliseconds = Math.min(
+      15 * 60_000,
+      Math.max(
+        2 * 60_000,
+        estimatedElevationRequests * 60_000
+      )
+    );
+
     elevationTimeoutId = window.setTimeout(
       () => {
         if (!activeElevationRequestId) {
@@ -632,10 +651,10 @@
         }
 
         offerExportWithoutElevation(
-        "Höjdhämtningen tog för lång tid."
-      );
+          "Höjdhämtningen tog för lång tid."
+        );
       },
-      60_000
+      elevationTimeoutMilliseconds
     );
   }
 
@@ -763,12 +782,11 @@
   }
 
   const shouldExport = window.confirm(
-  "Höjddata kunde inte hämtas.\n\n" +
-  `${errorMessage || "Höjdtjänsten svarade med ett fel."}\n\n` +
-  "Det kan bero på att linjen är längre än höjdtjänstens " +
-  "maxgräns på cirka 62 km.\n\n" +
-  "Vill du exportera GPX-filen utan höjddata?"
-);
+    "Höjddata kunde inte hämtas.\n\n" +
+    `${errorMessage || "Höjdtjänsten svarade med ett fel."}\n\n` +
+    "Tillägget försökte även dela långa linjer i mindre delar.\n\n" +
+    "Vill du exportera GPX-filen utan höjddata?"
+  );
 
   if (!shouldExport) {
     setStatus("Exporten avbröts.");
