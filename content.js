@@ -168,49 +168,42 @@
         }
 
         switch (result.action) {
-          case "LINES_FOUND":
-            handleLinesFound(result);
-            break;
+  case "LINES_FOUND":
+    handleLinesFound(result);
+    break;
 
-          case "ELEVATION_FOUND":
-            handleElevationFound(result);
-            break;
+  case "ELEVATION_FOUND":
+    handleElevationFound(result);
+    break;
 
-          case "HIGHLIGHTS_UPDATED":
-            break;
+  case "HIGHLIGHTS_UPDATED":
+    break;
 
-          case "ERROR":
-  if (
-    activeElevationRequestId &&
-    result.requestId === activeElevationRequestId
-  ) {
-    offerExportWithoutElevation(
-      result.message || "Kunde inte hämta höjddata."
+  case "ERROR":
+    if (
+      activeElevationRequestId &&
+      result.requestId === activeElevationRequestId
+    ) {
+      offerExportWithoutElevation(
+        result.message || "Kunde inte hämta höjddata."
+      );
+      break;
+    }
+
+    setStatus(
+      result.message || "Ett okänt fel inträffade.",
+      true
     );
     break;
-  }
 
-  setStatus(
-    result.message || "Ett okänt fel inträffade.",
-    true
-  );
-  break;
-  }
-
-  setStatus(
-    result.message || "Ett okänt fel inträffade.",
-    true
-  );
-  break;
-
-          case "PONG":
-            console.log(
-              "[Min karta GPX] Page bridge svarar."
-            );
-            break;
-        }
-      }
+  case "PONG":
+    console.log(
+      "[Min karta GPX] Page bridge svarar."
     );
+    break;
+        }
+  }
+);
   }
 
   function sendCommand(action, extraData = {}) {
@@ -743,10 +736,7 @@
   }
 
   function offerExportWithoutElevation(errorMessage) {
-  /*
-   * Kopiera informationen innan finishElevationRequest()
-   * tömmer pendingExportLines.
-   */
+
   const exportLines = pendingExportLines.map(
     (line, index) => ({
       id: line.id,
@@ -773,9 +763,12 @@
   }
 
   const shouldExport = window.confirm(
-    `${errorMessage || "Kunde inte hämta höjddata."}` +
-    "\n\nVill du exportera GPX-filen utan höjddata?"
-  );
+  "Höjddata kunde inte hämtas.\n\n" +
+  `${errorMessage || "Höjdtjänsten svarade med ett fel."}\n\n` +
+  "Det kan bero på att linjen är längre än höjdtjänstens " +
+  "maxgräns på cirka 62 km.\n\n" +
+  "Vill du exportera GPX-filen utan höjddata?"
+);
 
   if (!shouldExport) {
     setStatus("Exporten avbröts.");
