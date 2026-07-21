@@ -9,148 +9,302 @@
 
   const COMMAND_EVENT = "MINKARTA_GPX_IMPORT_COMMAND";
   const RESULT_EVENT = "MINKARTA_GPX_IMPORT_RESULT";
-  const CANVAS_ID = "mkgpx-import-map-overlay";
-  const LINE_COLOR = "#ff5a1f";
-  const LINE_OUTLINE_COLOR = "rgba(255, 255, 255, 0.92)";
-  const WAYPOINT_COLOR = "#ff5a1f";
+  const OLD_OVERLAY_ID = "mkgpx-import-map-overlay";
 
   let cachedMap = null;
-  let overlayCanvas = null;
-  let importedTracks = [];
-  let importedWaypoints = [];
-  let mapListenersInstalled = false;
 
-  window.addEventListener(
-    COMMAND_EVENT,
-    event => {
-      let command;
+  removeOldCanvasOverlay();
 
-      try {
-        command = parseCommand(event.detail);
-      } catch (error) {
-        sendError(error);
-        return;
-      }
+  window.addEventListener(COMMAND_EVENT, event => {
+    let command;
 
-      const requestId = command.requestId ?? null;
-
-      try {
-        switch (command.action) {
-          case "IMPORT_GPX":
-            importGpx(command, requestId);
-            break;
-
-          case "CLEAR_IMPORTED_GPX":
-            clearImportedGpx(requestId);
-            break;
-        }
-      } catch (error) {
-        sendError(error, requestId);
-      }
+    try {
+      command = parseCommand(event.detail);
+    } catch (error) {
+      sendError(error);
+      return;
     }
-  );
 
-  function importGpx(command, requestId) {
+    const requestId = command.requestId ?? null;
+
+    try {
+      if (command.action !== "IMPORT_GPX_AS_LINES") {
+        throw new Error(
+          `Okänt importkommando: ${String(command.action)}`
+        );
+      }
+
+      importGpxAsLines(command, requestId);
+    } catch (error) {
+      cachedMap = null;
+      sendError(error, requestId);
+    }
+  });
+
+  function importGpxAsLines(command, requestId) {
+    removeOldCanvasOverlay();
+
     const map = findMap();
     const tracks = Array.isArray(command.tracks)
       ? command.tracks
       : [];
 
-    const waypoints = Array.isArray(command.waypoints)
-      ? command.waypoints
-      : [];
+    const importSegments = [];
 
-    const convertedTracks = tracks
-      .map((track, trackIndex) => {
-        const segments = Array.isArray(track.segments)
-          ? track.segments
-              .map(convertSegment)
-              .filter(segment => segment.length >= 2)
-          : [];
+    tracks.forEach((track, trackIndex) => {
+      const baseName =
+        typeof track.name === "string" && track.name.trim()
+          ? track.name.trim()
+          : `Spår ${trackIndex + 1}`;
 
-        return {
-          name:
-            typeof track.name === "string" && track.name.trim()
-              ? track.name.trim()
-              : `Spår ${trackIndex + 1}`,
-          segments
-        };
-      })
-      .filter(track => track.segments.length > 0);
+      const segments = Array.isArray(track.segments)
+        ? track.segments
+        : [];
 
-    const convertedWaypoints = waypoints
-      .map((waypoint, waypointIndex) => {
-        const coordinate = convertCoordinate(
-          waypoint.coordinate
-        );
+      const convertedSegments = segments
+        .map(convertSegment)
+        .filter(segment => segment.length >= 2);
 
-        if (!coordinate) {
-          return null;
-        }
+      convertedSegments.forEach((coordinates, segmentIndex) => {
+        const name =
+          convertedSegments.length > 1
+            ? `${baseName} – del ${segmentIndex + 1}`
+            : baseName;
 
-        return {
-          name:
-            typeof waypoint.name === "string" &&
-            waypoint.name.trim()
-              ? waypoint.name.trim()
-              : `Punkt ${waypointIndex + 1}`,
-          coordinate
-        };
-      })
-      .filter(Boolean);
+        importSegments.push({
+          name,
+          coordinates
+        });
+      });
+    });
 
-    if (
-      convertedTracks.length === 0 &&
-      convertedWaypoints.length === 0
-    ) {
+    if (importSegments.length === 0) {
       throw new Error(
-        "GPX-filen saknar giltiga koordinater."
+        "GPX-filen innehåller inga giltiga spår eller rutter."
       );
     }
 
-    importedTracks = convertedTracks;
-    importedWaypoints = convertedWaypoints;
-
-    ensureOverlayCanvas(map);
-    installMapListeners(map);
-    redrawOverlay();
-    zoomToImportedData(map);
-
-    const segmentCount = importedTracks.reduce(
-      (total, track) => total + track.segments.length,
-      0
+    const target = findBestLineTarget(map);
+    const importedFeatures = importSegments.map(segment =>
+      createImportedFeature(
+        target.templateFeature,
+        segment.name,
+        segment.coordinates
+      )
     );
 
-    const trackPointCount = importedTracks.reduce(
-      (trackTotal, track) =>
-        trackTotal +
-        track.segments.reduce(
-          (segmentTotal, segment) =>
-            segmentTotal + segment.length,
-          0
-        ),
-      0
+    if (typeof target.source.addFeatures === "function") {
+      target.source.addFeatures(importedFeatures);
+    } else {
+      importedFeatures.forEach(feature => {
+        target.source.addFeature(feature);
+      });
+    }
+
+    target.source.changed?.();
+    target.layer.changed?.();
+    map.render?.();
+
+    zoomToCoordinates(
+      map,
+      importSegments.map(segment => segment.coordinates)
     );
 
     sendResult({
-      action: "GPX_IMPORTED",
+      action: "GPX_IMPORTED_AS_LINES",
       requestId,
-      trackCount: importedTracks.length,
-      segmentCount,
-      waypointCount: importedWaypoints.length,
-      pointCount:
-        trackPointCount + importedWaypoints.length
+      lineCount: importedFeatures.length,
+      pointCount: importSegments.reduce(
+        (total, segment) =>
+          total + segment.coordinates.length,
+        0
+      )
     });
   }
 
-  function clearImportedGpx(requestId) {
-    importedTracks = [];
-    importedWaypoints = [];
-    clearCanvas();
+  function findBestLineTarget(map) {
+    const candidates = [];
 
-    sendResult({
-      action: "GPX_IMPORT_CLEARED",
-      requestId
+    walkLayers(map, (layer, source, path) => {
+      if (
+        !source ||
+        typeof source.getFeatures !== "function" ||
+        typeof source.addFeature !== "function"
+      ) {
+        return;
+      }
+
+      let features;
+
+      try {
+        features = source.getFeatures();
+      } catch {
+        return;
+      }
+
+      if (!Array.isArray(features)) {
+        return;
+      }
+
+      features.forEach((feature, featureIndex) => {
+        const geometry = feature.getGeometry?.();
+        const type = geometry?.getType?.();
+
+        if (type !== "LineString") {
+          return;
+        }
+
+        if (
+          typeof feature.clone !== "function" ||
+          typeof geometry.clone !== "function"
+        ) {
+          return;
+        }
+
+        candidates.push({
+          layer,
+          source,
+          templateFeature: feature,
+          score: scoreLineCandidate(
+            layer,
+            feature,
+            features.length,
+            featureIndex,
+            path
+          )
+        });
+      });
+    });
+
+    candidates.sort((a, b) => b.score - a.score);
+
+    if (candidates.length === 0) {
+      throw new Error(
+        "Kunde inte hitta Min kartas linjelager. " +
+        "Rita en kort linje i kartan först och försök sedan importera igen."
+      );
+    }
+
+    return candidates[0];
+  }
+
+  function scoreLineCandidate(
+    layer,
+    feature,
+    featureCount,
+    featureIndex,
+    path
+  ) {
+    let score = 0;
+
+    const properties = feature.getProperties?.() ?? {};
+    const propertyNames = Object.keys(properties)
+      .join(" ")
+      .toLowerCase();
+
+    const propertyValues = Object.values(properties)
+      .filter(value => typeof value === "string")
+      .join(" ")
+      .toLowerCase();
+
+    const searchableText =
+      `${propertyNames} ${propertyValues} ${path}`;
+
+    if (/measure|measurement|distance|length|mat|mät/.test(searchableText)) {
+      score += 300;
+    }
+
+    if (/draw|drawing|sketch|rit/.test(searchableText)) {
+      score += 180;
+    }
+
+    if (feature.get?.("measure") === true) {
+      score += 300;
+    }
+
+    if (feature.get?.("minkartaGpxImported") === true) {
+      score -= 100;
+    }
+
+    if (layer.getVisible?.() !== false) {
+      score += 40;
+    }
+
+    const zIndex = Number(layer.getZIndex?.());
+
+    if (Number.isFinite(zIndex)) {
+      score += Math.min(100, Math.max(-100, zIndex / 10));
+    }
+
+    if (featureCount <= 50) {
+      score += 80;
+    } else if (featureCount <= 250) {
+      score += 25;
+    } else if (featureCount > 1000) {
+      score -= 250;
+    }
+
+    score += Math.min(20, featureIndex);
+
+    return score;
+  }
+
+  function createImportedFeature(
+    templateFeature,
+    name,
+    coordinates
+  ) {
+    const feature = templateFeature.clone();
+    const templateGeometry = templateFeature.getGeometry?.();
+    const geometry = templateGeometry.clone();
+
+    geometry.setCoordinates(
+      coordinates.map(coordinate => [
+        Number(coordinate[0]),
+        Number(coordinate[1])
+      ])
+    );
+
+    feature.setGeometry(geometry);
+    feature.set?.("name", name);
+    feature.set?.("title", name);
+    feature.set?.("minkartaGpxImported", true);
+
+    if (typeof feature.setId === "function") {
+      feature.setId(undefined);
+    }
+
+    feature.changed?.();
+    return feature;
+  }
+
+  function walkLayers(map, visit) {
+    const rootLayers =
+      map.getLayers?.().getArray?.() ??
+      map.getLayerGroup?.().getLayers?.().getArray?.() ??
+      [];
+
+    function inspect(layer, path) {
+      if (!layer) {
+        return;
+      }
+
+      if (typeof layer.getLayers === "function") {
+        const children =
+          layer.getLayers()?.getArray?.() ?? [];
+
+        children.forEach((child, index) => {
+          inspect(child, `${path}/${index}`);
+        });
+
+        return;
+      }
+
+      visit(layer, layer.getSource?.(), path);
+    }
+
+    rootLayers.forEach((layer, index) => {
+      inspect(layer, `layer-${index}`);
     });
   }
 
@@ -189,308 +343,30 @@
     const { easting, northing } =
       wgs84ToSweref99Tm(latitude, longitude);
 
-    const elevation =
-      coordinate.length >= 3
-        ? Number(coordinate[2])
-        : null;
-
-    if (Number.isFinite(elevation)) {
-      return [easting, northing, elevation];
-    }
-
     return [easting, northing];
   }
 
-  function ensureOverlayCanvas(map) {
-    const viewport = map.getViewport?.() ||
-      document.querySelector(".ol-viewport");
-
-    if (!viewport) {
-      throw new Error("Kunde inte hitta kartans visningsyta.");
-    }
-
-    let canvas = document.getElementById(CANVAS_ID);
-
-    if (!canvas) {
-      canvas = document.createElement("canvas");
-      canvas.id = CANVAS_ID;
-      canvas.setAttribute("aria-hidden", "true");
-
-      Object.assign(canvas.style, {
-        position: "absolute",
-        inset: "0",
-        width: "100%",
-        height: "100%",
-        pointerEvents: "none"
-      });
-
-      const controlsContainer =
-        viewport.querySelector(
-          ".ol-overlaycontainer-stopevent"
-        );
-
-      viewport.insertBefore(
-        canvas,
-        controlsContainer || null
-      );
-    }
-
-    overlayCanvas = canvas;
-    resizeCanvas();
-  }
-
-  function installMapListeners(map) {
-    if (mapListenersInstalled) {
-      return;
-    }
-
-    mapListenersInstalled = true;
-
-    map.on?.("postrender", redrawOverlay);
-    map.on?.("moveend", redrawOverlay);
-    map.on?.("change:size", redrawOverlay);
-
-    window.addEventListener("resize", redrawOverlay);
-  }
-
-  function redrawOverlay() {
-    if (!overlayCanvas || !cachedMap) {
-      return;
-    }
-
-    resizeCanvas();
-
-    const context = overlayCanvas.getContext("2d");
-
-    if (!context) {
-      return;
-    }
-
-    const width = overlayCanvas.clientWidth;
-    const height = overlayCanvas.clientHeight;
-    const pixelRatio = window.devicePixelRatio || 1;
-
-    context.setTransform(
-      pixelRatio,
-      0,
-      0,
-      pixelRatio,
-      0,
-      0
-    );
-
-    context.clearRect(0, 0, width, height);
-
-    if (
-      importedTracks.length === 0 &&
-      importedWaypoints.length === 0
-    ) {
-      return;
-    }
-
-    context.lineCap = "round";
-    context.lineJoin = "round";
-
-    drawTracks(context, LINE_OUTLINE_COLOR, 8);
-    drawTracks(context, LINE_COLOR, 4);
-    drawWaypoints(context);
-  }
-
-  function drawTracks(context, strokeStyle, lineWidth) {
-    context.strokeStyle = strokeStyle;
-    context.lineWidth = lineWidth;
-
-    for (const track of importedTracks) {
-      for (const segment of track.segments) {
-        let pathStarted = false;
-
-        context.beginPath();
-
-        for (const coordinate of segment) {
-          const pixel = cachedMap.getPixelFromCoordinate?.(
-            coordinate
-          );
-
-          if (
-            !Array.isArray(pixel) ||
-            !Number.isFinite(pixel[0]) ||
-            !Number.isFinite(pixel[1])
-          ) {
-            pathStarted = false;
-            continue;
-          }
-
-          if (!pathStarted) {
-            context.moveTo(pixel[0], pixel[1]);
-            pathStarted = true;
-          } else {
-            context.lineTo(pixel[0], pixel[1]);
-          }
-        }
-
-        if (pathStarted) {
-          context.stroke();
-        }
-      }
-    }
-  }
-
-  function drawWaypoints(context) {
-    context.font = "12px system-ui, sans-serif";
-    context.textBaseline = "middle";
-
-    const showLabels = importedWaypoints.length <= 40;
-
-    for (const waypoint of importedWaypoints) {
-      const pixel = cachedMap.getPixelFromCoordinate?.(
-        waypoint.coordinate
-      );
-
-      if (
-        !Array.isArray(pixel) ||
-        !Number.isFinite(pixel[0]) ||
-        !Number.isFinite(pixel[1])
-      ) {
-        continue;
-      }
-
-      context.beginPath();
-      context.arc(pixel[0], pixel[1], 6, 0, Math.PI * 2);
-      context.fillStyle = WAYPOINT_COLOR;
-      context.fill();
-      context.lineWidth = 2;
-      context.strokeStyle = "white";
-      context.stroke();
-
-      if (showLabels && waypoint.name) {
-        context.lineWidth = 3;
-        context.strokeStyle = "rgba(255,255,255,0.95)";
-        context.strokeText(
-          waypoint.name,
-          pixel[0] + 10,
-          pixel[1]
-        );
-
-        context.fillStyle = "#202020";
-        context.fillText(
-          waypoint.name,
-          pixel[0] + 10,
-          pixel[1]
-        );
-      }
-    }
-  }
-
-  function resizeCanvas() {
-    if (!overlayCanvas) {
-      return;
-    }
-
-    const width = Math.max(
-      1,
-      Math.round(overlayCanvas.clientWidth)
-    );
-
-    const height = Math.max(
-      1,
-      Math.round(overlayCanvas.clientHeight)
-    );
-
-    const pixelRatio = window.devicePixelRatio || 1;
-    const targetWidth = Math.round(width * pixelRatio);
-    const targetHeight = Math.round(height * pixelRatio);
-
-    if (
-      overlayCanvas.width !== targetWidth ||
-      overlayCanvas.height !== targetHeight
-    ) {
-      overlayCanvas.width = targetWidth;
-      overlayCanvas.height = targetHeight;
-    }
-  }
-
-  function clearCanvas() {
-    if (!overlayCanvas) {
-      return;
-    }
-
-    const context = overlayCanvas.getContext("2d");
-
-    context?.clearRect(
-      0,
-      0,
-      overlayCanvas.width,
-      overlayCanvas.height
-    );
-  }
-
-  function zoomToImportedData(map) {
-    const extent = calculateImportedExtent();
-
-    if (!extent) {
-      return;
-    }
-
-    const view = map.getView?.();
-
-    if (!view) {
-      return;
-    }
-
-    const width = extent[2] - extent[0];
-    const height = extent[3] - extent[1];
-
-    if (width < 1 && height < 1) {
-      view.setCenter?.([
-        (extent[0] + extent[2]) / 2,
-        (extent[1] + extent[3]) / 2
-      ]);
-
-      const currentZoom = Number(view.getZoom?.());
-
-      if (!Number.isFinite(currentZoom) || currentZoom < 14) {
-        view.setZoom?.(14);
-      }
-
-      return;
-    }
-
-    view.fit?.(extent, {
-      padding: [70, 70, 70, 70],
-      duration: 450,
-      maxZoom: 16
-    });
-  }
-
-  function calculateImportedExtent() {
+  function zoomToCoordinates(map, segments) {
     let minX = Infinity;
     let minY = Infinity;
     let maxX = -Infinity;
     let maxY = -Infinity;
 
-    const inspect = coordinate => {
-      const x = Number(coordinate?.[0]);
-      const y = Number(coordinate?.[1]);
+    segments.forEach(segment => {
+      segment.forEach(coordinate => {
+        const x = Number(coordinate?.[0]);
+        const y = Number(coordinate?.[1]);
 
-      if (!Number.isFinite(x) || !Number.isFinite(y)) {
-        return;
-      }
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          return;
+        }
 
-      minX = Math.min(minX, x);
-      minY = Math.min(minY, y);
-      maxX = Math.max(maxX, x);
-      maxY = Math.max(maxY, y);
-    };
-
-    for (const track of importedTracks) {
-      for (const segment of track.segments) {
-        segment.forEach(inspect);
-      }
-    }
-
-    for (const waypoint of importedWaypoints) {
-      inspect(waypoint.coordinate);
-    }
+        minX = Math.min(minX, x);
+        minY = Math.min(minY, y);
+        maxX = Math.max(maxX, x);
+        maxY = Math.max(maxY, y);
+      });
+    });
 
     if (
       !Number.isFinite(minX) ||
@@ -498,10 +374,20 @@
       !Number.isFinite(maxX) ||
       !Number.isFinite(maxY)
     ) {
-      return null;
+      return;
     }
 
-    return [minX, minY, maxX, maxY];
+    const view = map.getView?.();
+
+    view?.fit?.([minX, minY, maxX, maxY], {
+      padding: [70, 70, 70, 70],
+      duration: 450,
+      maxZoom: 16
+    });
+  }
+
+  function removeOldCanvasOverlay() {
+    document.getElementById(OLD_OVERLAY_ID)?.remove();
   }
 
   function isOpenLayersMap(value) {
@@ -642,115 +528,103 @@
   }
 
   function wgs84ToSweref99Tm(latitude, longitude) {
-    const axis = 6378137.0;
+    const semiMajorAxis = 6378137.0;
     const flattening = 1 / 298.257222101;
-    const centralMeridian = 15.0;
+    const centralMeridian = 15 * Math.PI / 180;
     const scale = 0.9996;
-    const falseNorthing = 0.0;
-    const falseEasting = 500000.0;
+    const falseEasting = 500000;
 
-    const e2 = flattening * (2.0 - flattening);
-    const n = flattening / (2.0 - flattening);
-    const aRoof =
-      axis /
-      (1.0 + n) *
-      (1.0 + n ** 2 / 4.0 + n ** 4 / 64.0);
+    const latitudeRadians = latitude * Math.PI / 180;
+    const longitudeRadians = longitude * Math.PI / 180;
 
-    const a = e2;
-    const b = (5.0 * e2 ** 2 - e2 ** 3) / 6.0;
-    const c =
-      (104.0 * e2 ** 3 - 45.0 * e2 ** 4) / 120.0;
-    const d = 1237.0 * e2 ** 4 / 1260.0;
+    const eccentricitySquared =
+      flattening * (2 - flattening);
 
-    const beta1 =
-      n / 2.0 -
-      2.0 * n ** 2 / 3.0 +
-      5.0 * n ** 3 / 16.0 +
-      41.0 * n ** 4 / 180.0;
+    const secondEccentricitySquared =
+      eccentricitySquared /
+      (1 - eccentricitySquared);
 
-    const beta2 =
-      13.0 * n ** 2 / 48.0 -
-      3.0 * n ** 3 / 5.0 +
-      557.0 * n ** 4 / 1440.0;
+    const sinLatitude = Math.sin(latitudeRadians);
+    const cosLatitude = Math.cos(latitudeRadians);
+    const tanLatitude = Math.tan(latitudeRadians);
 
-    const beta3 =
-      61.0 * n ** 3 / 240.0 -
-      103.0 * n ** 4 / 140.0;
-
-    const beta4 =
-      49561.0 * n ** 4 / 161280.0;
-
-    const degreesToRadians = Math.PI / 180.0;
-    const phi = latitude * degreesToRadians;
-    const lambda = longitude * degreesToRadians;
-    const lambdaZero = centralMeridian * degreesToRadians;
-
-    const sinPhi = Math.sin(phi);
-    const cosPhi = Math.cos(phi);
-
-    const phiStar =
-      phi -
-      sinPhi * cosPhi *
-      (
-        a +
-        b * sinPhi ** 2 +
-        c * sinPhi ** 4 +
-        d * sinPhi ** 6
+    const n =
+      semiMajorAxis /
+      Math.sqrt(
+        1 -
+        eccentricitySquared * sinLatitude ** 2
       );
 
-    const deltaLambda = lambda - lambdaZero;
+    const t = tanLatitude ** 2;
+    const c =
+      secondEccentricitySquared * cosLatitude ** 2;
 
-    const xiPrime = Math.atan(
-      Math.tan(phiStar) / Math.cos(deltaLambda)
-    );
+    const a =
+      cosLatitude *
+      (longitudeRadians - centralMeridian);
 
-    const etaPrime = atanh(
-      Math.cos(phiStar) * Math.sin(deltaLambda)
-    );
-
-    const northing =
-      scale * aRoof *
+    const meridionalArc =
+      semiMajorAxis *
       (
-        xiPrime +
-        beta1 *
-          Math.sin(2.0 * xiPrime) *
-          Math.cosh(2.0 * etaPrime) +
-        beta2 *
-          Math.sin(4.0 * xiPrime) *
-          Math.cosh(4.0 * etaPrime) +
-        beta3 *
-          Math.sin(6.0 * xiPrime) *
-          Math.cosh(6.0 * etaPrime) +
-        beta4 *
-          Math.sin(8.0 * xiPrime) *
-          Math.cosh(8.0 * etaPrime)
-      ) +
-      falseNorthing;
+        (
+          1 -
+          eccentricitySquared / 4 -
+          3 * eccentricitySquared ** 2 / 64 -
+          5 * eccentricitySquared ** 3 / 256
+        ) * latitudeRadians -
+        (
+          3 * eccentricitySquared / 8 +
+          3 * eccentricitySquared ** 2 / 32 +
+          45 * eccentricitySquared ** 3 / 1024
+        ) * Math.sin(2 * latitudeRadians) +
+        (
+          15 * eccentricitySquared ** 2 / 256 +
+          45 * eccentricitySquared ** 3 / 1024
+        ) * Math.sin(4 * latitudeRadians) -
+        (
+          35 * eccentricitySquared ** 3 / 3072
+        ) * Math.sin(6 * latitudeRadians)
+      );
 
     const easting =
-      scale * aRoof *
+      falseEasting +
+      scale * n *
       (
-        etaPrime +
-        beta1 *
-          Math.cos(2.0 * xiPrime) *
-          Math.sinh(2.0 * etaPrime) +
-        beta2 *
-          Math.cos(4.0 * xiPrime) *
-          Math.sinh(4.0 * etaPrime) +
-        beta3 *
-          Math.cos(6.0 * xiPrime) *
-          Math.sinh(6.0 * etaPrime) +
-        beta4 *
-          Math.cos(8.0 * xiPrime) *
-          Math.sinh(8.0 * etaPrime)
-      ) +
-      falseEasting;
+        a +
+        (1 - t + c) * a ** 3 / 6 +
+        (
+          5 -
+          18 * t +
+          t ** 2 +
+          72 * c -
+          58 * secondEccentricitySquared
+        ) * a ** 5 / 120
+      );
+
+    const northing =
+      scale *
+      (
+        meridionalArc +
+        n * tanLatitude *
+        (
+          a ** 2 / 2 +
+          (
+            5 -
+            t +
+            9 * c +
+            4 * c ** 2
+          ) * a ** 4 / 24 +
+          (
+            61 -
+            58 * t +
+            t ** 2 +
+            600 * c -
+            330 * secondEccentricitySquared
+          ) * a ** 6 / 720
+        )
+      );
 
     return { easting, northing };
-  }
-
-  function atanh(value) {
-    return 0.5 * Math.log((1.0 + value) / (1.0 - value));
   }
 
   function parseCommand(detail) {
@@ -787,6 +661,6 @@
   }
 
   console.log(
-    "[Min karta GPX] Importbryggan är laddad."
+    "[Min karta GPX] Integrerad GPX-import är laddad."
   );
 })();

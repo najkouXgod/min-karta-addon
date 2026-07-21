@@ -14,24 +14,28 @@
 
   let requestCounter = 0;
   let activeRequestId = null;
-  let importIsVisible = false;
 
   listenForImportResults();
   initializeWhenPanelExists();
 
   function initializeWhenPanelExists() {
     const initialize = () => {
-      const panel = document.getElementById("minkarta-gpx-panel");
+      const panel =
+        document.getElementById("minkarta-gpx-panel");
 
       if (!panel) {
         return false;
       }
 
-      if (document.getElementById("mkgpx-import-section")) {
+      document
+        .getElementById("mkgpx-import-section")
+        ?.remove();
+
+      if (document.getElementById("mkgpx-import-button")) {
         return true;
       }
 
-      createImportControls(panel);
+      createImportButton(panel);
       return true;
     };
 
@@ -53,76 +57,36 @@
     window.setTimeout(() => observer.disconnect(), 15_000);
   }
 
-  function createImportControls(panel) {
-    const section = document.createElement("section");
-    section.id = "mkgpx-import-section";
-    section.className = "mkgpx-import-section";
+  function createImportButton(panel) {
+    const actions =
+      panel.querySelector(".mkgpx-actions");
 
-    section.innerHTML = `
-      <div class="mkgpx-import-heading">Importera GPX</div>
-
-      <div class="mkgpx-import-actions">
-        <button id="mkgpx-import-button" type="button">
-          Välj GPX-fil
-        </button>
-
-        <button
-          id="mkgpx-clear-import-button"
-          type="button"
-          disabled
-        >
-          Ta bort import
-        </button>
-      </div>
-
-      <input
-        id="mkgpx-import-file"
-        type="file"
-        accept=".gpx,application/gpx+xml,application/xml,text/xml"
-        hidden
-      >
-
-      <p id="mkgpx-import-status" class="mkgpx-import-status">
-        Importerade spår visas ovanpå kartan.
-      </p>
-    `;
-
-    const contentInner =
-      panel.querySelector(".mkgpx-content-inner") || panel;
-
-    const fileSetting =
-      contentInner.querySelector(".mkgpx-file-setting");
-
-    if (fileSetting) {
-      contentInner.insertBefore(section, fileSetting);
-    } else {
-      contentInner.appendChild(section);
+    if (!actions) {
+      return;
     }
 
-    const importButton =
-      section.querySelector("#mkgpx-import-button");
+    const importButton = document.createElement("button");
+    importButton.id = "mkgpx-import-button";
+    importButton.type = "button";
+    importButton.textContent = "Importera GPX";
 
-    const clearButton =
-      section.querySelector("#mkgpx-clear-import-button");
+    const fileInput = document.createElement("input");
+    fileInput.id = "mkgpx-import-file";
+    fileInput.type = "file";
+    fileInput.accept =
+      ".gpx,application/gpx+xml,application/xml,text/xml";
+    fileInput.hidden = true;
 
-    const fileInput =
-      section.querySelector("#mkgpx-import-file");
+    actions.prepend(importButton);
+    panel.appendChild(fileInput);
 
     importButton.addEventListener("click", () => {
-      fileInput.value = "";
-      fileInput.click();
-    });
-
-    clearButton.addEventListener("click", () => {
       if (activeRequestId) {
         return;
       }
 
-      activeRequestId = sendImportCommand(
-        "CLEAR_IMPORTED_GPX"
-      );
-
-      setImportBusy(true, "Tar bort importerad GPX...");
+      fileInput.value = "";
+      fileInput.click();
     });
 
     fileInput.addEventListener("change", async () => {
@@ -142,30 +106,31 @@
     }
 
     if (file.size > MAX_FILE_SIZE_BYTES) {
-      setImportStatus(
+      setMainStatus(
         "GPX-filen är större än 25 MB.",
         true
       );
       return;
     }
 
-    setImportBusy(true, `Läser ${file.name}...`);
+    setImportBusy(true);
+    setMainStatus(`Läser ${file.name}...`);
 
     try {
       const xmlText = await file.text();
-      const parsed = parseGpx(xmlText, file.name);
+      const parsed = parseGpx(xmlText);
 
       activeRequestId = sendImportCommand(
-        "IMPORT_GPX",
+        "IMPORT_GPX_AS_LINES",
         parsed
       );
 
-      setImportStatus("Ritar GPX-spåret på kartan...");
+      setMainStatus("Lägger till GPX-spåret som linjer...");
     } catch (error) {
       activeRequestId = null;
       setImportBusy(false);
 
-      setImportStatus(
+      setMainStatus(
         error instanceof Error
           ? error.message
           : "Kunde inte läsa GPX-filen.",
@@ -174,7 +139,7 @@
     }
   }
 
-  function parseGpx(xmlText, filename) {
+  function parseGpx(xmlText) {
     const xml = new DOMParser().parseFromString(
       xmlText,
       "application/xml"
@@ -191,7 +156,6 @@
     }
 
     const tracks = [];
-    const waypoints = [];
     let totalPointCount = 0;
 
     for (const trackElement of elementsByName(root, "trk")) {
@@ -216,7 +180,6 @@
           name:
             directChildText(trackElement, "name") ||
             `Spår ${tracks.length + 1}`,
-          sourceType: "track",
           segments
         });
       }
@@ -232,7 +195,6 @@
           name:
             directChildText(routeElement, "name") ||
             `Rutt ${tracks.length + 1}`,
-          sourceType: "route",
           segments: [route]
         });
 
@@ -240,30 +202,9 @@
       }
     }
 
-    for (const waypointElement of elementsByName(root, "wpt")) {
-      const point = readPoint(waypointElement);
-
-      if (!point) {
-        continue;
-      }
-
-      waypoints.push({
-        name:
-          directChildText(waypointElement, "name") ||
-          `Punkt ${waypoints.length + 1}`,
-        description:
-          directChildText(waypointElement, "desc") ||
-          directChildText(waypointElement, "cmt") ||
-          "",
-        coordinate: point
-      });
-
-      totalPointCount++;
-    }
-
-    if (tracks.length === 0 && waypoints.length === 0) {
+    if (tracks.length === 0) {
       throw new Error(
-        "GPX-filen innehåller inga spår, rutter eller waypoints."
+        "GPX-filen innehåller inga spår eller rutter."
       );
     }
 
@@ -274,11 +215,7 @@
       );
     }
 
-    return {
-      filename,
-      tracks,
-      waypoints
-    };
+    return { tracks };
   }
 
   function readPointElements(elements) {
@@ -308,14 +245,6 @@
       longitude > 180
     ) {
       return null;
-    }
-
-    const elevationText = directChildText(element, "ele");
-    const elevation =
-      elevationText === "" ? null : Number(elevationText);
-
-    if (Number.isFinite(elevation)) {
-      return [longitude, latitude, elevation];
     }
 
     return [longitude, latitude];
@@ -382,54 +311,33 @@
 
       if (
         activeRequestId &&
-        result.requestId &&
         result.requestId !== activeRequestId
       ) {
         return;
       }
 
       switch (result.action) {
-        case "GPX_IMPORTED": {
+        case "GPX_IMPORTED_AS_LINES":
           activeRequestId = null;
-          importIsVisible = true;
           setImportBusy(false);
-          updateClearButton();
-
-          const parts = [];
-
-          if (result.trackCount > 0) {
-            parts.push(
-              `${result.trackCount} spår/rutter`
-            );
-          }
-
-          if (result.waypointCount > 0) {
-            parts.push(
-              `${result.waypointCount} waypoints`
-            );
-          }
-
-          setImportStatus(
-            `Visar ${parts.join(" och ")} · ` +
+          setMainStatus(
+            `Importerade ${result.lineCount} linjer · ` +
             `${Number(result.pointCount || 0).toLocaleString("sv-SE")} punkter.`
           );
-          break;
-        }
 
-        case "GPX_IMPORT_CLEARED":
-          activeRequestId = null;
-          importIsVisible = false;
-          setImportBusy(false);
-          updateClearButton();
-          setImportStatus("Importerad GPX borttagen.");
+          window.setTimeout(() => {
+            document
+              .getElementById("mkgpx-refresh")
+              ?.click();
+          }, 100);
           break;
 
         case "GPX_IMPORT_ERROR":
           activeRequestId = null;
           setImportBusy(false);
-          updateClearButton();
-          setImportStatus(
-            result.message || "Kunde inte importera GPX-filen.",
+          setMainStatus(
+            result.message ||
+              "Kunde inte importera GPX-filen.",
             true
           );
           break;
@@ -437,51 +345,29 @@
     });
   }
 
-  function setImportBusy(isBusy, message = null) {
-    const importButton =
+  function setImportBusy(isBusy) {
+    const button =
       document.getElementById("mkgpx-import-button");
 
-    const clearButton =
-      document.getElementById("mkgpx-clear-import-button");
-
-    if (importButton) {
-      importButton.disabled = isBusy;
-      importButton.textContent = isBusy
-        ? "Arbetar..."
-        : "Välj GPX-fil";
+    if (!button) {
+      return;
     }
 
-    if (clearButton) {
-      clearButton.disabled = isBusy || !importIsVisible;
-    }
-
-    if (message) {
-      setImportStatus(message);
-    }
+    button.disabled = isBusy;
+    button.textContent = isBusy
+      ? "Importerar..."
+      : "Importera GPX";
   }
 
-  function updateClearButton() {
-    const clearButton =
-      document.getElementById("mkgpx-clear-import-button");
-
-    if (clearButton) {
-      clearButton.disabled =
-        Boolean(activeRequestId) || !importIsVisible;
-    }
-  }
-
-  function setImportStatus(message, isError = false) {
+  function setMainStatus(message, isError = false) {
     const status =
-      document.getElementById("mkgpx-import-status");
+      document.getElementById("mkgpx-status");
 
     if (!status) {
       return;
     }
 
     status.textContent = message;
-    status.classList.toggle(
-      "mkgpx-import-error",
-      isError
-    );
+    status.classList.toggle("mkgpx-error", isError);
   }
 })();
