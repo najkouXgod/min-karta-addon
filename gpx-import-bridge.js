@@ -18,7 +18,7 @@
 
   removeOldCanvasOverlay();
 
-  window.addEventListener(COMMAND_EVENT, event => {
+  window.addEventListener(COMMAND_EVENT, async event => {
     let command;
 
     try {
@@ -37,14 +37,14 @@
         );
       }
 
-      importGpxAsLines(command, requestId);
+      await importGpxAsLines(command, requestId);
     } catch (error) {
       cachedMap = null;
       sendError(error, requestId);
     }
   });
 
-  function importGpxAsLines(command, requestId) {
+  async function importGpxAsLines(command, requestId) {
     removeOldCanvasOverlay();
 
     const map = findMap();
@@ -53,8 +53,21 @@
       : [];
 
     const rawSegments = [];
+    const totalSegments = tracks.reduce(
+      (total, track) =>
+        total + (Array.isArray(track.segments) ? track.segments.length : 0),
+      0
+    );
 
-    tracks.forEach(track => {
+    let convertedSegmentCount = 0;
+
+    sendProgress(
+      requestId,
+      "Förbereder GPX-spåret..."
+    );
+    await yieldToBrowser();
+
+    for (const track of tracks) {
       const explicitName =
         typeof track.name === "string" && track.name.trim()
           ? track.name.trim()
@@ -64,9 +77,23 @@
         ? track.segments
         : [];
 
-      const convertedSegments = segments
-        .map(convertSegment)
-        .filter(segment => segment.length >= 2);
+      const convertedSegments = [];
+
+      for (const segment of segments) {
+        const converted = await convertSegmentAsync(segment);
+        convertedSegmentCount++;
+
+        sendProgress(
+          requestId,
+          totalSegments > 1
+            ? `Förbereder spår ${convertedSegmentCount} av ${totalSegments}...`
+            : "Förbereder GPX-spåret..."
+        );
+
+        if (converted.length >= 2) {
+          convertedSegments.push(converted);
+        }
+      }
 
       convertedSegments.forEach((coordinates, segmentIndex) => {
         rawSegments.push({
@@ -77,7 +104,7 @@
           coordinates
         });
       });
-    });
+    }
 
     if (rawSegments.length === 0) {
       throw new Error(
@@ -97,10 +124,26 @@
       )
     }));
 
+    sendProgress(
+      requestId,
+      "Hittar Min kartas linjelager..."
+    );
+    await yieldToBrowser();
+
     const context = findImportContext(map);
     const importedFeatures = [];
 
-    for (const segment of importSegments) {
+    for (let index = 0; index < importSegments.length; index++) {
+      const segment = importSegments[index];
+
+      sendProgress(
+        requestId,
+        importSegments.length > 1
+          ? `Lägger till linje ${index + 1} av ${importSegments.length}...`
+          : "Lägger till GPX-spåret som linje..."
+      );
+      await yieldToBrowser();
+
       const feature = createIntegratedFeature(
         context,
         segment.name,
@@ -239,32 +282,85 @@
       );
     }
 
-    interaction.abortDrawing?.();
+    const source = getInteractionSource(interaction);
+    const existingFeatures = new Set(
+      source?.getFeatures?.() ?? []
+    );
 
-    interaction.appendCoordinates(
+    let createdFeature = null;
+
+    const drawEndHandler = event => {
+      createdFeature = event?.feature ?? createdFeature;
+    };
+
+    interaction.once?.("drawend", drawEndHandler);
+
+    const wasActive = interaction.getActive?.();
+
+    if (wasActive === false) {
+      interaction.setActive?.(true);
+    }
+
+    try {
+      interaction.abortDrawing?.();
+
+      const first = coordinates[0];
+      const last = coordinates[coordinates.length - 1];
+
+      /*
+       * Mata bara ritverktyget med två punkter. Att skicka tusentals
+       * GPX-punkter via appendCoordinates är mycket långsamt.
+       * Hela geometrin sätts direkt efter att featuren har skapats.
+       */
+      interaction.appendCoordinates([
+        [Number(first[0]), Number(first[1])],
+        [Number(last[0]), Number(last[1])]
+      ]);
+
+      const returnedFeature = interaction.finishDrawing();
+      createdFeature = returnedFeature ?? createdFeature;
+
+      if (!createdFeature && source?.getFeatures) {
+        createdFeature = source
+          .getFeatures()
+          .find(feature => !existingFeatures.has(feature)) ?? null;
+      }
+    } finally {
+      if (wasActive === false) {
+        interaction.setActive?.(false);
+      }
+    }
+
+    if (!createdFeature) {
+      throw new Error(
+        "Min kartas ritverktyg skapade ingen linje."
+      );
+    }
+
+    const geometry = createdFeature.getGeometry?.();
+
+    if (!geometry || typeof geometry.setCoordinates !== "function") {
+      throw new Error(
+        "Den importerade linjens geometri kunde inte uppdateras."
+      );
+    }
+
+    geometry.setCoordinates(
       coordinates.map(coordinate => [
         Number(coordinate[0]),
         Number(coordinate[1])
       ])
     );
 
-    const feature = interaction.finishDrawing();
+    createdFeature.setGeometry?.(geometry);
+    applyImportedMetadata(createdFeature, name);
+    clearClonedHighlightStyle(createdFeature);
+    reapplyImportedName(createdFeature, name);
+    createdFeature.changed?.();
+    source?.changed?.();
+    map.render?.();
 
-    if (!feature || typeof feature.setGeometry !== "function") {
-      throw new Error(
-        "Min kartas ritverktyg skapade ingen linje."
-      );
-    }
-
-    applyImportedMetadata(feature, name);
-    clearClonedHighlightStyle(feature);
-    reapplyImportedName(feature, name);
-
-    /*
-     * Ingen map.render() här – importGpxAsLines() renderar
-     * redan en gång efter att alla segment importerats.
-     */
-    return feature;
+    return createdFeature;
   }
 
   function createByCloningTemplate(
@@ -309,16 +405,9 @@
       feature.setId(undefined);
     }
 
-    /*
-     * Vi anropar INTE source.changed()/layer.changed() här.
-     * importGpxAsLines() gör redan det en gång efter att ALLA
-     * segment lagts till. Om vi gjorde det per segment skulle
-     * importGpxAsLines() av en fil med många spårdelar (t.ex.
-     * en lång vandring med många trkseg) tvinga fram en full
-     * omritning av hela lagret för varje enskild linje –
-     * vilket gör stora importer extremt långsamma.
-     */
     context.source.addFeature(feature);
+    context.source.changed?.();
+    context.layer?.changed?.();
 
     reapplyImportedName(feature, name);
     feature.changed?.();
@@ -390,6 +479,22 @@
       }
 
       if (!Array.isArray(features)) {
+        return;
+      }
+
+      const layerSourceText = [
+        propertiesAsText(layer),
+        propertiesAsText(source),
+        path
+      ].join(" ").toLowerCase();
+
+      const looksLikeDrawingLayer =
+        /measure|measurement|distance|length|mat|mät|draw|drawing|sketch|rit/.test(
+          layerSourceText
+        );
+
+      /* Hoppa över stora bakgrundslager som annars kan ta lång tid att skanna. */
+      if (features.length > 500 && !looksLikeDrawingLayer) {
         return;
       }
 
@@ -622,7 +727,17 @@
         return;
       }
 
-      for (const feature of features ?? []) {
+      const featureList = features ?? [];
+      const sourceText = propertiesAsText(source).toLowerCase();
+
+      if (
+        featureList.length > 500 &&
+        !/measure|measurement|distance|length|mat|mät|draw|drawing|sketch|rit/.test(sourceText)
+      ) {
+        return;
+      }
+
+      for (const feature of featureList) {
         const type = feature.getGeometry?.()?.getType?.();
 
         if (
@@ -861,14 +976,27 @@
     );
   }
 
-  function convertSegment(segment) {
+  async function convertSegmentAsync(segment) {
     if (!Array.isArray(segment)) {
       return [];
     }
 
-    return segment
-      .map(convertCoordinate)
-      .filter(Boolean);
+    const converted = [];
+    const batchSize = 5_000;
+
+    for (let index = 0; index < segment.length; index++) {
+      const coordinate = convertCoordinate(segment[index]);
+
+      if (coordinate) {
+        converted.push(coordinate);
+      }
+
+      if (index > 0 && index % batchSize === 0) {
+        await yieldToBrowser();
+      }
+    }
+
+    return converted;
   }
 
   function convertCoordinate(coordinate) {
@@ -1180,6 +1308,21 @@
     return { easting, northing };
   }
 
+
+  function sendProgress(requestId, message) {
+    sendResult({
+      action: "GPX_IMPORT_PROGRESS",
+      requestId,
+      message
+    });
+  }
+
+  function yieldToBrowser() {
+    return new Promise(resolve => {
+      window.setTimeout(resolve, 0);
+    });
+  }
+
   function parseCommand(detail) {
     if (typeof detail === "string") {
       return JSON.parse(detail);
@@ -1214,6 +1357,6 @@
   }
 
   console.log(
-    "[Min karta GPX] Integrerad GPX-import v0.4 är laddad."
+    "[Min karta GPX] Integrerad GPX-import v0.5 är laddad."
   );
 })();

@@ -1,7 +1,6 @@
 (() => {
   "use strict";
 
-  // Förhindra att skriptet startas flera gånger.
   if (window.__MINKARTA_GPX_BRIDGE_LOADED__) {
     return;
   }
@@ -10,25 +9,23 @@
 
   const COMMAND_EVENT = "MINKARTA_GPX_COMMAND";
   const RESULT_EVENT = "MINKARTA_GPX_RESULT";
-  const ELEVATION_URL =
-    "/api/hojdprofil/hojdprofil/v1";
+  const ELEVATION_URL = "/api/hojdprofil/hojdprofil/v1";
+
+  const HIGHLIGHT_COLOR = "#00e5ff";
+  const ELEVATION_CHUNK_LENGTH_METERS = 55_000;
+  const MIN_RETRY_CHUNK_LENGTH_METERS = 2_000;
+  const MAX_PARALLEL_ELEVATION_REQUESTS = 2;
+  const MAX_ELEVATION_INPUT_POINTS = 5_000;
+  const COORDINATE_MATCH_TOLERANCE_METERS = 0.5;
 
   let cachedMap = null;
+  let nextFeatureId = 1;
 
-  /*
-   * Varje OpenLayers-feature får ett eget ID.
-   * Själva feature-objektet skickas inte till content.js.
-   */
   const featureIds = new WeakMap();
   const featuresById = new Map();
   const featureLayers = new WeakMap();
-  const originalHighlightStates = new WeakMap();
   const highlightedFeatures = new Map();
-
-  const HIGHLIGHT_COLOR = "#00e5ff";
-  const HIGHLIGHT_WIDTH = 7;
-
-  let nextFeatureId = 1;
+  const originalHighlightStates = new WeakMap();
 
   function isOpenLayersMap(value) {
     return Boolean(
@@ -41,23 +38,6 @@
     );
   }
 
-  function getFeatureId(feature) {
-    if (featureIds.has(feature)) {
-      return featureIds.get(feature);
-    }
-
-    const id = `line-${nextFeatureId++}`;
-
-    featureIds.set(feature, id);
-    featuresById.set(id, feature);
-
-    return id;
-  }
-
-  /**
-   * Försöker först använda sökvägen vi redan hittat.
-   * Om Lantmäteriet ändrar React-strukturen görs en bredare sökning.
-   */
   function findMap() {
     if (isOpenLayersMap(cachedMap)) {
       return cachedMap;
@@ -78,8 +58,6 @@
 
       if (fiberKey) {
         const fiber = element[fiberKey];
-
-        // Den sökväg vi hittade vid testningen.
         const directMap =
           fiber?.return?.stateNode?.props
             ?.maps?.WEMAP_KARTA?.map;
@@ -89,7 +67,6 @@
           return cachedMap;
         }
 
-        // Reservmetod om React-strukturen ändras något.
         const searchedMap = searchForMap(fiber);
 
         if (searchedMap) {
@@ -106,7 +83,6 @@
 
   function searchForMap(root) {
     const visited = new WeakSet();
-
     let inspectedObjects = 0;
     const maxObjects = 50_000;
     const maxDepth = 16;
@@ -141,7 +117,6 @@
       visited.add(value);
       inspectedObjects++;
 
-      // Undvik att söka igenom hela DOM-trädet.
       if (
         value instanceof Node ||
         value === window ||
@@ -162,24 +137,16 @@
         let descriptor;
 
         try {
-          descriptor =
-            Object.getOwnPropertyDescriptor(value, key);
+          descriptor = Object.getOwnPropertyDescriptor(value, key);
         } catch {
           continue;
         }
 
-        /*
-         * Kör inte getters från webbplatsen.
-         * Vi läser bara vanliga lagrade värden.
-         */
         if (!descriptor || !("value" in descriptor)) {
           continue;
         }
 
-        const result = search(
-          descriptor.value,
-          depth + 1
-        );
+        const result = search(descriptor.value, depth + 1);
 
         if (result) {
           return result;
@@ -195,10 +162,7 @@
   function getTopLevelLayers(map) {
     return (
       map.getLayers?.().getArray?.() ??
-      map
-        .getLayerGroup?.()
-        .getLayers?.()
-        .getArray?.() ??
+      map.getLayerGroup?.().getLayers?.().getArray?.() ??
       []
     );
   }
@@ -209,6 +173,49 @@
     }
 
     return coordinates.map(copyCoordinates);
+  }
+
+  function getFeatureId(feature) {
+    if (featureIds.has(feature)) {
+      return featureIds.get(feature);
+    }
+
+    const id = `line-${nextFeatureId++}`;
+    featureIds.set(feature, id);
+    featuresById.set(id, feature);
+    return id;
+  }
+
+  function calculateSegmentLength(coordinates) {
+    let length = 0;
+
+    for (let index = 1; index < coordinates.length; index++) {
+      const previous = coordinates[index - 1];
+      const current = coordinates[index];
+
+      length += Math.hypot(
+        Number(current?.[0]) - Number(previous?.[0]),
+        Number(current?.[1]) - Number(previous?.[1])
+      );
+    }
+
+    return length;
+  }
+
+  function calculateLength(type, coordinates) {
+    if (type === "LineString") {
+      return calculateSegmentLength(coordinates);
+    }
+
+    if (type === "MultiLineString") {
+      return coordinates.reduce(
+        (total, segment) =>
+          total + calculateSegmentLength(segment),
+        0
+      );
+    }
+
+    return 0;
   }
 
   function countPoints(type, coordinates) {
@@ -226,56 +233,16 @@
     return 0;
   }
 
-  function calculateSegmentLength(coordinates) {
-    let length = 0;
-
-    for (let index = 1; index < coordinates.length; index++) {
-      const [previousX, previousY] =
-        coordinates[index - 1];
-
-      const [currentX, currentY] =
-        coordinates[index];
-
-      length += Math.hypot(
-        currentX - previousX,
-        currentY - previousY
-      );
-    }
-
-    return length;
-  }
-
-  /*
-   * EPSG:3006 använder meter, så avståndet mellan
-   * koordinaterna ger en användbar linjelängd i meter.
-   */
-  function calculateLength(type, coordinates) {
-    if (type === "LineString") {
-      return calculateSegmentLength(coordinates);
-    }
-
-    if (type === "MultiLineString") {
-      return coordinates.reduce(
-        (total, segment) =>
-          total + calculateSegmentLength(segment),
-        0
-      );
-    }
-
-    return 0;
-  }
-
   function getFeatureName(feature, fallbackName) {
     const possibleNames = [
+      feature.get?.("minkartaGpxName"),
       feature.get?.("name"),
       feature.get?.("title"),
       feature.get?.("label")
     ];
 
-    const name = possibleNames.find(
-      value =>
-        typeof value === "string" &&
-        value.trim().length > 0
+    const name = possibleNames.find(value =>
+      typeof value === "string" && value.trim()
     );
 
     return name?.trim() ?? fallbackName;
@@ -290,9 +257,6 @@
         return;
       }
 
-      /*
-       * Ett lager kan vara en grupp med fler lager.
-       */
       if (typeof layer.getLayers === "function") {
         const children =
           layer.getLayers()?.getArray?.() ?? [];
@@ -306,10 +270,7 @@
 
       const source = layer.getSource?.();
 
-      if (
-        !source ||
-        typeof source.getFeatures !== "function"
-      ) {
+      if (!source || typeof source.getFeatures !== "function") {
         return;
       }
 
@@ -321,10 +282,12 @@
         return;
       }
 
-      for (const feature of features) {
+      for (const feature of features ?? []) {
         const geometry = feature.getGeometry?.();
         const type = geometry?.getType?.();
+
         featureLayers.set(feature, layer);
+
         if (
           type !== "LineString" &&
           type !== "MultiLineString"
@@ -332,247 +295,125 @@
           continue;
         }
 
-        const rawCoordinates =
-          geometry.getCoordinates?.();
+        const rawCoordinates = geometry.getCoordinates?.();
 
         if (!Array.isArray(rawCoordinates)) {
           continue;
         }
 
-        const coordinates =
-          copyCoordinates(rawCoordinates);
-
+        const coordinates = copyCoordinates(rawCoordinates);
         const fallbackName = `Linje ${lineNumber}`;
 
         lines.push({
           id: getFeatureId(feature),
-          name: getFeatureName(
-            feature,
-            fallbackName
-          ),
+          name: getFeatureName(feature, fallbackName),
           type,
           layerPath: path,
           coordinates,
-          pointCount: countPoints(
-            type,
-            coordinates
-          ),
-          lengthMeters: calculateLength(
-            type,
-            coordinates
-          )
+          pointCount: countPoints(type, coordinates),
+          lengthMeters: calculateLength(type, coordinates)
         });
 
         lineNumber++;
       }
     }
 
-    const layers = getTopLevelLayers(map);
-
-    layers.forEach((layer, index) => {
+    getTopLevelLayers(map).forEach((layer, index) => {
       inspectLayer(layer, `layer-${index}`);
     });
 
     return lines;
   }
 
-  function getOwnFeatureProperty(
-    feature,
-    propertyName
-  ) {
-    const properties =
-      feature.getProperties?.() ?? {};
-
-    return {
-      exists: Object.prototype.hasOwnProperty.call(
-        properties,
-        propertyName
-      ),
-      value: properties[propertyName]
-    };
-  }
-
   function getRenderedFeatureStyle(feature) {
-  const resolution =
-    cachedMap
+    const resolution = cachedMap
       ?.getView?.()
       ?.getResolution?.();
 
-  const directStyle =
-    feature.getStyle?.();
+    const directStyle = feature.getStyle?.();
 
-  if (typeof directStyle === "function") {
-    return directStyle(feature, resolution);
-  }
-
-  if (directStyle) {
-    return directStyle;
-  }
-
-  const layer =
-    featureLayers.get(feature);
-
-  const layerStyleFunction =
-    layer?.getStyleFunction?.();
-
-  if (
-    typeof layerStyleFunction === "function"
-  ) {
-    return layerStyleFunction(
-      feature,
-      resolution
-    );
-  }
-
-  return null;
-}
-
-function cloneOpenLayersStyle(style) {
-  const sourceStyles =
-    Array.isArray(style)
-      ? style
-      : [style];
-
-  const outlineStyles = [];
-  const originalStyles = [];
-
-  for (const sourceStyle of sourceStyles) {
-    if (
-      !sourceStyle ||
-      typeof sourceStyle.clone !== "function"
-    ) {
-      continue;
+    if (typeof directStyle === "function") {
+      return directStyle(feature, resolution);
     }
 
-    const innerStyle =
-      sourceStyle.clone();
+    if (directStyle) {
+      return directStyle;
+    }
 
-    const sourceStroke =
-      sourceStyle.getStroke?.();
+    const layer = featureLayers.get(feature);
+    const layerStyleFunction = layer?.getStyleFunction?.();
 
-    if (sourceStroke) {
-      const outlineStyle =
-        sourceStyle.clone();
+    if (typeof layerStyleFunction === "function") {
+      return layerStyleFunction(feature, resolution);
+    }
 
-      const outlineStroke =
-        typeof sourceStroke.clone === "function"
+    return null;
+  }
+
+  function cloneHighlightStyles(style) {
+    const sourceStyles = Array.isArray(style) ? style : [style];
+    const outlines = [];
+    const originals = [];
+
+    for (const sourceStyle of sourceStyles) {
+      if (!sourceStyle || typeof sourceStyle.clone !== "function") {
+        continue;
+      }
+
+      const original = sourceStyle.clone();
+      const sourceStroke = sourceStyle.getStroke?.();
+
+      if (sourceStroke) {
+        const outline = sourceStyle.clone();
+        const stroke = typeof sourceStroke.clone === "function"
           ? sourceStroke.clone()
           : sourceStroke;
 
-      const originalWidth =
-        Number(
-          sourceStroke.getWidth?.()
-        ) || 2;
+        const width = Number(sourceStroke.getWidth?.()) || 2;
+        stroke.setColor?.(HIGHLIGHT_COLOR);
+        stroke.setWidth?.(width + 5);
+        outline.setStroke?.(stroke);
+        outline.setFill?.(null);
+        outline.setImage?.(null);
+        outline.setText?.(null);
+        outline.setZIndex?.(9_999);
+        outlines.push(outline);
+      }
 
-      outlineStroke.setColor?.(
-        HIGHLIGHT_COLOR
-      );
-
-      outlineStroke.setWidth?.(
-        originalWidth + 5
-      );
-
-      outlineStyle.setStroke?.(
-        outlineStroke
-      );
-
-      // Cyanmarkeringen ska bara vara en linje.
-      outlineStyle.setFill?.(null);
-      outlineStyle.setImage?.(null);
-      outlineStyle.setText?.(null);
-      outlineStyle.setZIndex?.(9_999);
-
-      outlineStyles.push(
-        outlineStyle
-      );
+      original.setZIndex?.(10_000);
+      originals.push(original);
     }
 
-    // Originallinjen ritas ovanpå den cyan kanten.
-    innerStyle.setZIndex?.(10_000);
-    originalStyles.push(innerStyle);
+    const styles = [...outlines, ...originals];
+    return styles.length > 0 ? styles : null;
   }
 
-  const styles = [
-    ...outlineStyles,
-    ...originalStyles
-  ];
-
-  return styles.length > 0
-    ? styles
-    : null;
-}
-
-  function applyFeatureHighlight(
-    featureId,
-    feature
-  ) {
+  function applyFeatureHighlight(featureId, feature) {
     if (!feature || highlightedFeatures.has(featureId)) {
       return;
     }
 
-    const styleProperty =
-      getOwnFeatureProperty(
-        feature,
-        "style"
-      );
+    const directStyle = feature.getStyle?.();
 
-    const directStyle =
-      feature.getStyle?.();
+    originalHighlightStates.set(feature, { directStyle });
 
-    originalHighlightStates.set(
-      feature,
-      {
-        stylePropertyExists:
-          styleProperty.exists,
-        stylePropertyValue:
-          styleProperty.value,
-        directStyle
-      }
+    const highlightedStyle = cloneHighlightStyles(
+      getRenderedFeatureStyle(feature)
     );
 
-    const renderedStyle =
-  getRenderedFeatureStyle(feature);
-
-const highlightedDirectStyle =
-  cloneOpenLayersStyle(renderedStyle);
-
-    if (
-      highlightedDirectStyle &&
-      typeof feature.setStyle === "function"
-    ) {
-      feature.setStyle(
-        highlightedDirectStyle
-      );
+    if (highlightedStyle && typeof feature.setStyle === "function") {
+      feature.setStyle(highlightedStyle);
     }
 
     feature.changed?.();
-    highlightedFeatures.set(
-      featureId,
-      feature
-    );
+    highlightedFeatures.set(featureId, feature);
   }
 
-  function restoreFeatureHighlight(
-    featureId,
-    feature
-  ) {
-    const state =
-      originalHighlightStates.get(feature);
+  function restoreFeatureHighlight(featureId, feature) {
+    const state = originalHighlightStates.get(feature);
 
-    if (state) {
-      if (typeof feature.setStyle === "function") {
-        feature.setStyle(state.directStyle);
-      }
-
-      if (state.stylePropertyExists) {
-        feature.set?.(
-          "style",
-          state.stylePropertyValue
-        );
-      } else {
-        feature.unset?.("style");
-      }
-
+    if (state && typeof feature.setStyle === "function") {
+      feature.setStyle(state.directStyle);
       originalHighlightStates.delete(feature);
     }
 
@@ -582,8 +423,6 @@ const highlightedDirectStyle =
 
   function setHighlightedLines(lineIds) {
     const map = findMap();
-
-    // Uppdatera feature-registret innan ID:n används.
     findDrawnLines(map);
 
     const requestedIds = new Set(
@@ -592,27 +431,17 @@ const highlightedDirectStyle =
         : []
     );
 
-    for (
-      const [featureId, feature] of
-      [...highlightedFeatures.entries()]
-    ) {
+    for (const [featureId, feature] of highlightedFeatures) {
       if (!requestedIds.has(featureId)) {
-        restoreFeatureHighlight(
-          featureId,
-          feature
-        );
+        restoreFeatureHighlight(featureId, feature);
       }
     }
 
     for (const featureId of requestedIds) {
-      const feature =
-        featuresById.get(featureId);
+      const feature = featuresById.get(featureId);
 
       if (feature) {
-        applyFeatureHighlight(
-          featureId,
-          feature
-        );
+        applyFeatureHighlight(featureId, feature);
       }
     }
 
@@ -620,13 +449,9 @@ const highlightedDirectStyle =
 
     return {
       projection:
-        map
-          .getView?.()
-          .getProjection?.()
-          .getCode?.() ?? null,
-      lineIds: [...requestedIds].filter(
-        featureId =>
-          highlightedFeatures.has(featureId)
+        map.getView?.().getProjection?.().getCode?.() ?? null,
+      lineIds: [...requestedIds].filter(id =>
+        highlightedFeatures.has(id)
       )
     };
   }
@@ -637,10 +462,8 @@ const highlightedDirectStyle =
     }
 
     if (type === "MultiLineString") {
-      return coordinates.filter(
-        segment =>
-          Array.isArray(segment) &&
-          segment.length >= 2
+      return coordinates.filter(segment =>
+        Array.isArray(segment) && segment.length >= 2
       );
     }
 
@@ -656,15 +479,11 @@ const highlightedDirectStyle =
             type: "Feature",
             geometry: {
               type: "LineString",
-              coordinates:
-                copyCoordinates(coordinates)
+              coordinates: copyCoordinates(coordinates)
             },
             properties: {
               measure: true,
-              length:
-                calculateSegmentLength(
-                  coordinates
-                )
+              length: calculateSegmentLength(coordinates)
             }
           }
         ]
@@ -672,34 +491,21 @@ const highlightedDirectStyle =
     };
   }
 
-  function normalizeElevationCoordinates(
-    coordinates,
-    noDataValue
-  ) {
+  function normalizeElevationCoordinates(coordinates, noDataValue) {
     if (!Array.isArray(coordinates)) {
-      throw new Error(
-        "Höjdtjänsten returnerade inga koordinater."
-      );
+      throw new Error("Höjdtjänsten returnerade inga koordinater.");
     }
 
     return coordinates.map(coordinate => {
-      if (
-        !Array.isArray(coordinate) ||
-        coordinate.length < 3
-      ) {
-        throw new Error(
-          "Höjdtjänsten returnerade en ogiltig punkt."
-        );
+      if (!Array.isArray(coordinate) || coordinate.length < 3) {
+        throw new Error("Höjdtjänsten returnerade en ogiltig punkt.");
       }
 
       const easting = Number(coordinate[0]);
       const northing = Number(coordinate[1]);
       const rawElevation = Number(coordinate[2]);
 
-      if (
-        !Number.isFinite(easting) ||
-        !Number.isFinite(northing)
-      ) {
+      if (!Number.isFinite(easting) || !Number.isFinite(northing)) {
         throw new Error(
           "Höjdtjänsten returnerade ogiltiga kartkoordinater."
         );
@@ -711,23 +517,11 @@ const highlightedDirectStyle =
           ? rawElevation
           : null;
 
-      return [
-        easting,
-        northing,
-        elevation
-      ];
+      return [easting, northing, elevation];
     });
   }
 
-    const ELEVATION_CHUNK_LENGTH_METERS = 50_000;
-  const MIN_RETRY_CHUNK_LENGTH_METERS = 2_000;
-  const COORDINATE_MATCH_TOLERANCE_METERS = 0.5;
-
-  function interpolateCoordinate(
-    start,
-    end,
-    fraction
-  ) {
+  function interpolateCoordinate(start, end, fraction) {
     return [
       Number(start[0]) +
         (Number(end[0]) - Number(start[0])) * fraction,
@@ -740,53 +534,25 @@ const highlightedDirectStyle =
     coordinates,
     maxLengthMeters = ELEVATION_CHUNK_LENGTH_METERS
   ) {
-    if (
-      !Array.isArray(coordinates) ||
-      coordinates.length < 2
-    ) {
-      throw new Error(
-        "Linjen måste innehålla minst två punkter."
-      );
-    }
-
-    if (
-      !Number.isFinite(maxLengthMeters) ||
-      maxLengthMeters <= 0
-    ) {
-      throw new Error(
-        "Ogiltig maxlängd för höjddelar."
-      );
+    if (!Array.isArray(coordinates) || coordinates.length < 2) {
+      throw new Error("Linjen måste innehålla minst två punkter.");
     }
 
     const chunks = [];
     const epsilon = 0.001;
+    let currentChunk = [copyCoordinates(coordinates[0])];
+    let currentLength = 0;
 
-    let currentChunk = [
-      copyCoordinates(coordinates[0])
-    ];
-
-    let currentChunkLength = 0;
-
-    for (
-      let index = 1;
-      index < coordinates.length;
-      index++
-    ) {
-      let edgeStart =
-        copyCoordinates(coordinates[index - 1]);
-
-      const edgeEnd =
-        copyCoordinates(coordinates[index]);
-
+    for (let index = 1; index < coordinates.length; index++) {
+      let edgeStart = copyCoordinates(coordinates[index - 1]);
+      const edgeEnd = copyCoordinates(coordinates[index]);
       let remainingEdgeLength = Math.hypot(
         Number(edgeEnd[0]) - Number(edgeStart[0]),
         Number(edgeEnd[1]) - Number(edgeStart[1])
       );
 
       if (!Number.isFinite(remainingEdgeLength)) {
-        throw new Error(
-          "Linjen innehåller ogiltiga koordinater."
-        );
+        throw new Error("Linjen innehåller ogiltiga koordinater.");
       }
 
       if (remainingEdgeLength <= epsilon) {
@@ -796,35 +562,33 @@ const highlightedDirectStyle =
 
       while (remainingEdgeLength > epsilon) {
         const remainingChunkLength =
-          maxLengthMeters - currentChunkLength;
+          maxLengthMeters - currentLength;
 
         if (remainingChunkLength <= epsilon) {
           if (currentChunk.length >= 2) {
             chunks.push(currentChunk);
           }
 
-          currentChunk = [
-            copyCoordinates(edgeStart)
-          ];
-
-          currentChunkLength = 0;
+          currentChunk = [copyCoordinates(edgeStart)];
+          currentLength = 0;
           continue;
         }
 
-        if (
-          remainingEdgeLength <=
-          remainingChunkLength + epsilon
-        ) {
+        if (remainingEdgeLength <= remainingChunkLength + epsilon) {
           currentChunk.push(edgeEnd);
-          currentChunkLength += remainingEdgeLength;
+          currentLength += remainingEdgeLength;
           remainingEdgeLength = 0;
+
+          if (currentChunk.length >= MAX_ELEVATION_INPUT_POINTS) {
+            chunks.push(currentChunk);
+            currentChunk = [copyCoordinates(edgeEnd)];
+            currentLength = 0;
+          }
+
           continue;
         }
 
-        const fraction =
-          remainingChunkLength /
-          remainingEdgeLength;
-
+        const fraction = remainingChunkLength / remainingEdgeLength;
         const splitPoint = interpolateCoordinate(
           edgeStart,
           edgeEnd,
@@ -833,14 +597,9 @@ const highlightedDirectStyle =
 
         currentChunk.push(splitPoint);
         chunks.push(currentChunk);
-
-        currentChunk = [
-          copyCoordinates(splitPoint)
-        ];
-
-        currentChunkLength = 0;
+        currentChunk = [copyCoordinates(splitPoint)];
+        currentLength = 0;
         edgeStart = splitPoint;
-
         remainingEdgeLength = Math.hypot(
           Number(edgeEnd[0]) - Number(edgeStart[0]),
           Number(edgeEnd[1]) - Number(edgeStart[1])
@@ -855,12 +614,7 @@ const highlightedDirectStyle =
     return chunks;
   }
 
-  function coordinatesMatch(
-    first,
-    second,
-    toleranceMeters =
-      COORDINATE_MATCH_TOLERANCE_METERS
-  ) {
+  function coordinatesMatch(first, second) {
     if (
       !Array.isArray(first) ||
       !Array.isArray(second) ||
@@ -870,22 +624,14 @@ const highlightedDirectStyle =
       return false;
     }
 
-    return (
-      Math.hypot(
-        Number(first[0]) - Number(second[0]),
-        Number(first[1]) - Number(second[1])
-      ) <= toleranceMeters
-    );
+    return Math.hypot(
+      Number(first[0]) - Number(second[0]),
+      Number(first[1]) - Number(second[1])
+    ) <= COORDINATE_MATCH_TOLERANCE_METERS;
   }
 
-  function mergeElevationCoordinates(
-    target,
-    source
-  ) {
-    if (
-      !Array.isArray(source) ||
-      source.length === 0
-    ) {
+  function mergeElevationCoordinates(target, source) {
+    if (!Array.isArray(source) || source.length === 0) {
       return target;
     }
 
@@ -897,41 +643,28 @@ const highlightedDirectStyle =
     const startIndex = coordinatesMatch(
       target[target.length - 1],
       source[0]
-    )
-      ? 1
-      : 0;
+    ) ? 1 : 0;
 
     target.push(...source.slice(startIndex));
     return target;
   }
 
-  async function fetchElevationForSegment(
-    coordinates
-  ) {
-    if (
-      !Array.isArray(coordinates) ||
-      coordinates.length < 2
-    ) {
-      throw new Error(
-        "Linjen måste innehålla minst två punkter."
-      );
+  async function fetchElevationForSegment(coordinates) {
+    if (!Array.isArray(coordinates) || coordinates.length < 2) {
+      throw new Error("Linjen måste innehålla minst två punkter.");
     }
 
-    const response = await fetch(
-      ELEVATION_URL,
-      {
-        method: "POST",
-        headers: {
-          Accept:
-            "application/json, text/plain, */*",
-          "Content-Type": "application/json"
-        },
-        credentials: "include",
-        body: JSON.stringify(
-          createElevationRequest(coordinates)
-        )
-      }
-    );
+    const response = await fetch(ELEVATION_URL, {
+      method: "POST",
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "Content-Type": "application/json"
+      },
+      credentials: "include",
+      body: JSON.stringify(
+        createElevationRequest(coordinates)
+      )
+    });
 
     if (!response.ok) {
       const error = new Error(
@@ -949,167 +682,130 @@ const highlightedDirectStyle =
       geometry?.type !== "LineString" ||
       !Array.isArray(geometry.coordinates)
     ) {
-      throw new Error(
-        "Höjdtjänsten returnerade ett oväntat svar."
-      );
+      throw new Error("Höjdtjänsten returnerade ett oväntat svar.");
     }
 
-    const noDataValue = Number(
+    const rawNoDataValue = Number(
       result?.properties?.nodatavalue
     );
+    const noDataValue = Number.isFinite(rawNoDataValue)
+      ? rawNoDataValue
+      : -9999;
 
     return {
       coordinates: normalizeElevationCoordinates(
         geometry.coordinates,
-        Number.isFinite(noDataValue)
-          ? noDataValue
-          : -9999
+        noDataValue
       ),
-      noDataValue: Number.isFinite(noDataValue)
-        ? noDataValue
-        : -9999
+      noDataValue
     };
   }
 
-  async function fetchElevationForChunk(
-    coordinates
-  ) {
+  async function fetchElevationForChunk(coordinates) {
     try {
-      return await fetchElevationForSegment(
-        coordinates
-      );
+      return await fetchElevationForSegment(coordinates);
     } catch (error) {
-      const segmentLength =
-        calculateSegmentLength(coordinates);
-
+      const segmentLength = calculateSegmentLength(coordinates);
       const shouldRetrySmaller =
         error?.status === 422 &&
-        segmentLength >
-          MIN_RETRY_CHUNK_LENGTH_METERS;
+        segmentLength > MIN_RETRY_CHUNK_LENGTH_METERS;
 
       if (!shouldRetrySmaller) {
         throw error;
       }
 
-      const retryMaxLength = Math.max(
-        MIN_RETRY_CHUNK_LENGTH_METERS,
-        segmentLength / 2
-      );
-
       const retryChunks = splitSegmentByLength(
         coordinates,
-        retryMaxLength
+        Math.max(
+          MIN_RETRY_CHUNK_LENGTH_METERS,
+          segmentLength / 2
+        )
       );
 
       if (retryChunks.length <= 1) {
         throw error;
       }
 
-      return fetchAndMergeElevationChunks(
-        retryChunks
-      );
+      return fetchAndMergeElevationChunks(retryChunks);
     }
   }
 
-  /*
-   * Max antal samtidiga höjdanrop. De körs mot samma tjänst,
-   * så vi begränsar samtidigheten istället för att köra allt
-   * på en gång (undviker att överbelasta/bli strypta av API:t).
-   */
-  const ELEVATION_FETCH_CONCURRENCY = 4;
-
-  async function fetchAndMergeElevationChunks(
-    chunks
-  ) {
-    const results = new Array(chunks.length);
-    let nextChunkIndex = 0;
+  async function mapWithConcurrency(items, limit, mapper) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
 
     async function worker() {
-      while (nextChunkIndex < chunks.length) {
-        const chunkIndex = nextChunkIndex++;
-        results[chunkIndex] = await fetchElevationForChunk(
-          chunks[chunkIndex]
-        );
+      while (true) {
+        const index = nextIndex++;
+
+        if (index >= items.length) {
+          return;
+        }
+
+        results[index] = await mapper(items[index], index);
       }
     }
 
-    const workerCount = Math.min(
-      ELEVATION_FETCH_CONCURRENCY,
-      chunks.length
+    const workerCount = Math.min(limit, items.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, () => worker())
     );
 
-    await Promise.all(
-      Array.from({ length: workerCount }, worker)
+    return results;
+  }
+
+  async function fetchAndMergeElevationChunks(
+    chunks,
+    onChunkComplete = null
+  ) {
+    const results = await mapWithConcurrency(
+      chunks,
+      MAX_PARALLEL_ELEVATION_REQUESTS,
+      async chunk => {
+        const result = await fetchElevationForChunk(chunk);
+        onChunkComplete?.();
+        return result;
+      }
     );
 
     const mergedCoordinates = [];
     let noDataValue = -9999;
 
-    /*
-     * Resultaten hämtades parallellt men "results" har fortfarande
-     * samma ordning som "chunks", så ihopslagningen blir korrekt.
-     */
-    for (const elevationResult of results) {
-      noDataValue = elevationResult.noDataValue;
-
+    for (const result of results) {
+      noDataValue = result.noDataValue;
       mergeElevationCoordinates(
         mergedCoordinates,
-        elevationResult.coordinates
+        result.coordinates
       );
     }
 
-    return {
-      coordinates: mergedCoordinates,
-      noDataValue
-    };
+    return { coordinates: mergedCoordinates, noDataValue };
   }
 
-  async function getElevationForLines(
-    lineIds
-  ) {
-    if (
-      !Array.isArray(lineIds) ||
-      lineIds.length === 0
-    ) {
-      throw new Error(
-        "Inga linjer valdes för höjdhämtning."
-      );
+  async function getElevationForLines(lineIds, requestId) {
+    if (!Array.isArray(lineIds) || lineIds.length === 0) {
+      throw new Error("Inga linjer valdes för höjdhämtning.");
     }
 
     const map = findMap();
-
-    /*
-     * Uppdatera feature-registret innan ID:n slås upp.
-     * Det hjälper om kartan har laddat om sina lager.
-     */
     findDrawnLines(map);
 
-    const elevationLines = [];
+    const preparedLines = [];
+    let totalChunks = 0;
 
     for (const lineId of lineIds) {
       const feature = featuresById.get(lineId);
 
       if (!feature) {
-        throw new Error(
-          `Kunde inte hitta linjen ${String(lineId)}.`
-        );
+        throw new Error(`Kunde inte hitta linjen ${String(lineId)}.`);
       }
 
       const geometry = feature.getGeometry?.();
       const type = geometry?.getType?.();
-      const rawCoordinates =
-        geometry?.getCoordinates?.();
-
-      if (!Array.isArray(rawCoordinates)) {
-        throw new Error(
-          `Linjen ${String(lineId)} saknar koordinater.`
-        );
-      }
-
-      const segments = getLineSegments(
-        type,
-        copyCoordinates(rawCoordinates)
+      const coordinates = copyCoordinates(
+        geometry?.getCoordinates?.()
       );
+      const segments = getLineSegments(type, coordinates);
 
       if (segments.length === 0) {
         throw new Error(
@@ -1117,39 +813,59 @@ const highlightedDirectStyle =
         );
       }
 
+      const segmentChunks = segments.map(segment =>
+        splitSegmentByLength(segment)
+      );
+
+      totalChunks += segmentChunks.reduce(
+        (total, chunks) => total + chunks.length,
+        0
+      );
+
+      preparedLines.push({
+        id: lineId,
+        feature,
+        type,
+        segmentChunks
+      });
+    }
+
+    let completedChunks = 0;
+
+    const reportProgress = () => {
+      completedChunks++;
+      sendResult({
+        action: "ELEVATION_PROGRESS",
+        requestId,
+        completed: completedChunks,
+        total: totalChunks
+      });
+    };
+
+    const elevationLines = [];
+
+    for (const preparedLine of preparedLines) {
       const elevationSegments = [];
 
-      /*
-       * Varje ursprunglig delsträcka delas i delar på högst
-       * 50 km. Anropen körs i ordning och slås sedan ihop
-       * till samma sammanhängande GPX-segment.
-       */
-      for (const segment of segments) {
-        const chunks = splitSegmentByLength(
-          segment
+      for (const chunks of preparedLine.segmentChunks) {
+        const result = await fetchAndMergeElevationChunks(
+          chunks,
+          reportProgress
         );
 
-        const elevationResult =
-          await fetchAndMergeElevationChunks(
-            chunks
-          );
-
-        elevationSegments.push(
-          elevationResult.coordinates
-        );
+        elevationSegments.push(result.coordinates);
       }
 
       elevationLines.push({
-        id: lineId,
+        id: preparedLine.id,
         name: getFeatureName(
-          feature,
-          String(lineId)
+          preparedLine.feature,
+          String(preparedLine.id)
         ),
-        type,
+        type: preparedLine.type,
         segments: elevationSegments,
         pointCount: elevationSegments.reduce(
-          (total, segment) =>
-            total + segment.length,
+          (total, segment) => total + segment.length,
           0
         )
       });
@@ -1157,21 +873,12 @@ const highlightedDirectStyle =
 
     return {
       projection:
-        map
-          .getView?.()
-          .getProjection?.()
-          .getCode?.() ?? null,
+        map.getView?.().getProjection?.().getCode?.() ?? null,
       lines: elevationLines
     };
   }
 
-
   function sendResult(payload) {
-    /*
-     * JSON-strängen gör kommunikationen mellan MAIN och
-     * ISOLATED enklare och förhindrar problem med JS-objekt
-     * från olika körmiljöer.
-     */
     window.dispatchEvent(
       new CustomEvent(RESULT_EVENT, {
         detail: JSON.stringify(payload)
@@ -1197,112 +904,82 @@ const highlightedDirectStyle =
       return JSON.parse(detail);
     }
 
-    if (
-      detail &&
-      typeof detail === "object"
-    ) {
+    if (detail && typeof detail === "object") {
       return detail;
     }
 
     throw new Error("Ogiltigt kommando.");
   }
 
-  window.addEventListener(
-    COMMAND_EVENT,
-    async event => {
-      let command;
+  window.addEventListener(COMMAND_EVENT, async event => {
+    let command;
 
-      try {
-        command = parseCommand(event.detail);
-      } catch (error) {
-        sendError(error);
-        return;
-      }
-
-      const {
-        action,
-        requestId = null
-      } = command;
-
-      try {
-        switch (action) {
-          case "PING": {
-            sendResult({
-              action: "PONG",
-              requestId
-            });
-
-            break;
-          }
-
-          case "FIND_LINES": {
-            const map = findMap();
-            const view = map.getView();
-            const lines = findDrawnLines(map);
-
-            sendResult({
-              action: "LINES_FOUND",
-              requestId,
-              projection:
-                view
-                  .getProjection?.()
-                  .getCode?.() ?? null,
-              lines
-            });
-
-            break;
-          }
-
-          case "GET_ELEVATION": {
-            const elevationResult =
-              await getElevationForLines(
-                command.lineIds
-              );
-
-            sendResult({
-              action: "ELEVATION_FOUND",
-              requestId,
-              projection:
-                elevationResult.projection,
-              lines: elevationResult.lines
-            });
-
-            break;
-          }
-
-          case "SET_HIGHLIGHTED_LINES": {
-            const highlightResult =
-              setHighlightedLines(
-                command.lineIds
-              );
-
-            sendResult({
-              action: "HIGHLIGHTS_UPDATED",
-              requestId,
-              projection:
-                highlightResult.projection,
-              lineIds: highlightResult.lineIds
-            });
-
-            break;
-          }
-
-          default: {
-            throw new Error(
-              `Okänt kommando: ${String(action)}`
-            );
-          }
-        }
-      } catch (error) {
-        /*
-         * Kartobjektet kan ha blivit gammalt efter att
-         * webbplatsen har laddat om delar av appen.
-         */
-        cachedMap = null;
-        sendError(error, requestId);
-      }
+    try {
+      command = parseCommand(event.detail);
+    } catch (error) {
+      sendError(error);
+      return;
     }
-  );
 
-  console.log("[Min karta GPX] Page bridge är laddad.");
+    const { action, requestId = null } = command;
+
+    try {
+      switch (action) {
+        case "PING":
+          sendResult({ action: "PONG", requestId });
+          break;
+
+        case "FIND_LINES": {
+          const map = findMap();
+          const lines = findDrawnLines(map);
+
+          sendResult({
+            action: "LINES_FOUND",
+            requestId,
+            projection:
+              map.getView?.().getProjection?.().getCode?.() ?? null,
+            lines
+          });
+          break;
+        }
+
+        case "GET_ELEVATION": {
+          const result = await getElevationForLines(
+            command.lineIds,
+            requestId
+          );
+
+          sendResult({
+            action: "ELEVATION_FOUND",
+            requestId,
+            projection: result.projection,
+            lines: result.lines
+          });
+          break;
+        }
+
+        case "SET_HIGHLIGHTED_LINES": {
+          const result = setHighlightedLines(command.lineIds);
+
+          sendResult({
+            action: "HIGHLIGHTS_UPDATED",
+            requestId,
+            projection: result.projection,
+            lineIds: result.lineIds
+          });
+          break;
+        }
+
+        default:
+          throw new Error(`Okänt kommando: ${String(action)}`);
+      }
+    } catch (error) {
+      cachedMap = null;
+      sendError(error, requestId);
+    }
+  });
+
+  console.log(
+    "[Min karta GPX] Page bridge v0.5 är laddad."
+  );
 })();

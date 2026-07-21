@@ -176,6 +176,23 @@
     handleElevationFound(result);
     break;
 
+  case "ELEVATION_PROGRESS": {
+    if (
+      activeElevationRequestId &&
+      result.requestId === activeElevationRequestId
+    ) {
+      const completed = Number(result.completed) || 0;
+      const total = Number(result.total) || 0;
+
+      setStatus(
+        total > 0
+          ? `Hämtar höjddata... del ${completed} av ${total}`
+          : "Hämtar höjddata..."
+      );
+    }
+    break;
+  }
+
   case "HIGHLIGHTS_UPDATED":
     break;
 
@@ -633,14 +650,14 @@
 
     const estimatedElevationRequests = Math.max(
       1,
-      Math.ceil(totalLengthMeters / 50_000)
+      Math.ceil(totalLengthMeters / 55_000)
     );
 
     const elevationTimeoutMilliseconds = Math.min(
       15 * 60_000,
       Math.max(
         2 * 60_000,
-        estimatedElevationRequests * 60_000
+        Math.ceil(estimatedElevationRequests / 2) * 60_000
       )
     );
 

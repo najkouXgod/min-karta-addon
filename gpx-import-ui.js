@@ -11,7 +11,7 @@
   const RESULT_EVENT = "MINKARTA_GPX_IMPORT_RESULT";
   const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
   const MAX_IMPORT_POINTS = 150_000;
-  const IMPORT_TIMEOUT_MS = 30_000;
+  const IMPORT_TIMEOUT_MS = 120_000;
 
   let requestCounter = 0;
   let activeRequestId = null;
@@ -131,6 +131,8 @@
 
       startRequestTimeout(requestId);
 
+      setMainStatus("Förbereder GPX-spåret...");
+
       sendImportCommand(
         "IMPORT_GPX_AS_LINES",
         {
@@ -139,8 +141,6 @@
         },
         requestId
       );
-
-      setMainStatus("Lägger till GPX-spåret som linjer...");
     } catch (error) {
       finishRequest();
 
@@ -314,7 +314,7 @@
 
       finishRequest();
       setMainStatus(
-        "Importen svarade inte. Ladda om Min karta och försök igen.",
+        "Importen tog för lång tid. Prova en mindre GPX-fil eller ladda om Min karta.",
         true
       );
     }, IMPORT_TIMEOUT_MS);
@@ -362,6 +362,12 @@
       }
 
       switch (result.action) {
+        case "GPX_IMPORT_PROGRESS":
+          setMainStatus(
+            result.message || "Importerar GPX-spåret..."
+          );
+          break;
+
         case "GPX_IMPORTED_AS_LINES":
           finishRequest();
           setMainStatus(
