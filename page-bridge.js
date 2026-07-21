@@ -1011,16 +1011,45 @@ const highlightedDirectStyle =
     }
   }
 
+  /*
+   * Max antal samtidiga höjdanrop. De körs mot samma tjänst,
+   * så vi begränsar samtidigheten istället för att köra allt
+   * på en gång (undviker att överbelasta/bli strypta av API:t).
+   */
+  const ELEVATION_FETCH_CONCURRENCY = 4;
+
   async function fetchAndMergeElevationChunks(
     chunks
   ) {
+    const results = new Array(chunks.length);
+    let nextChunkIndex = 0;
+
+    async function worker() {
+      while (nextChunkIndex < chunks.length) {
+        const chunkIndex = nextChunkIndex++;
+        results[chunkIndex] = await fetchElevationForChunk(
+          chunks[chunkIndex]
+        );
+      }
+    }
+
+    const workerCount = Math.min(
+      ELEVATION_FETCH_CONCURRENCY,
+      chunks.length
+    );
+
+    await Promise.all(
+      Array.from({ length: workerCount }, worker)
+    );
+
     const mergedCoordinates = [];
     let noDataValue = -9999;
 
-    for (const chunk of chunks) {
-      const elevationResult =
-        await fetchElevationForChunk(chunk);
-
+    /*
+     * Resultaten hämtades parallellt men "results" har fortfarande
+     * samma ordning som "chunks", så ihopslagningen blir korrekt.
+     */
+    for (const elevationResult of results) {
       noDataValue = elevationResult.noDataValue;
 
       mergeElevationCoordinates(

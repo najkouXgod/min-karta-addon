@@ -260,7 +260,10 @@
     clearClonedHighlightStyle(feature);
     reapplyImportedName(feature, name);
 
-    map.render?.();
+    /*
+     * Ingen map.render() här – importGpxAsLines() renderar
+     * redan en gång efter att alla segment importerats.
+     */
     return feature;
   }
 
@@ -306,9 +309,16 @@
       feature.setId(undefined);
     }
 
+    /*
+     * Vi anropar INTE source.changed()/layer.changed() här.
+     * importGpxAsLines() gör redan det en gång efter att ALLA
+     * segment lagts till. Om vi gjorde det per segment skulle
+     * importGpxAsLines() av en fil med många spårdelar (t.ex.
+     * en lång vandring med många trkseg) tvinga fram en full
+     * omritning av hela lagret för varje enskild linje –
+     * vilket gör stora importer extremt långsamma.
+     */
     context.source.addFeature(feature);
-    context.source.changed?.();
-    context.layer?.changed?.();
 
     reapplyImportedName(feature, name);
     feature.changed?.();
