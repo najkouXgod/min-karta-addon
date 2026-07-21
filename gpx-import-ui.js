@@ -11,9 +11,11 @@
   const RESULT_EVENT = "MINKARTA_GPX_IMPORT_RESULT";
   const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024;
   const MAX_IMPORT_POINTS = 150_000;
+  const IMPORT_TIMEOUT_MS = 30_000;
 
   let requestCounter = 0;
   let activeRequestId = null;
+  let requestTimeoutId = null;
 
   listenForImportResults();
   initializeWhenPanelExists();
@@ -58,8 +60,7 @@
   }
 
   function createImportButton(panel) {
-    const actions =
-      panel.querySelector(".mkgpx-actions");
+    const actions = panel.querySelector(".mkgpx-actions");
 
     if (!actions) {
       return;
@@ -120,15 +121,28 @@
       const xmlText = await file.text();
       const parsed = parseGpx(xmlText);
 
-      activeRequestId = sendImportCommand(
+      /*
+       * Event skickas synkront mellan ISOLATED och MAIN.
+       * Därför måste activeRequestId sättas före dispatchEvent,
+       * annars kan ett snabbt svar lämna importknappen låst.
+       */
+      const requestId = createRequestId();
+      activeRequestId = requestId;
+
+      startRequestTimeout(requestId);
+
+      sendImportCommand(
         "IMPORT_GPX_AS_LINES",
-        parsed
+        {
+          ...parsed,
+          sourceFilename: file.name
+        },
+        requestId
       );
 
       setMainStatus("Lägger till GPX-spåret som linjer...");
     } catch (error) {
-      activeRequestId = null;
-      setImportBusy(false);
+      finishRequest();
 
       setMainStatus(
         error instanceof Error
@@ -177,9 +191,9 @@
 
       if (segments.length > 0) {
         tracks.push({
+          /* null betyder att importbryggan ska skapa Linje N. */
           name:
-            directChildText(trackElement, "name") ||
-            `Spår ${tracks.length + 1}`,
+            directChildText(trackElement, "name") || null,
           segments
         });
       }
@@ -193,8 +207,7 @@
       if (route.length >= 2) {
         tracks.push({
           name:
-            directChildText(routeElement, "name") ||
-            `Rutt ${tracks.length + 1}`,
+            directChildText(routeElement, "name") || null,
           segments: [route]
         });
 
@@ -270,11 +283,16 @@
     return child?.textContent?.trim() || "";
   }
 
-  function sendImportCommand(action, extraData = {}) {
+  function createRequestId() {
     requestCounter++;
+    return `gpx-import-${requestCounter}`;
+  }
 
-    const requestId = `gpx-import-${requestCounter}`;
-
+  function sendImportCommand(
+    action,
+    extraData,
+    requestId
+  ) {
     window.dispatchEvent(
       new CustomEvent(COMMAND_EVENT, {
         detail: JSON.stringify({
@@ -284,8 +302,35 @@
         })
       })
     );
+  }
 
-    return requestId;
+  function startRequestTimeout(requestId) {
+    clearRequestTimeout();
+
+    requestTimeoutId = window.setTimeout(() => {
+      if (activeRequestId !== requestId) {
+        return;
+      }
+
+      finishRequest();
+      setMainStatus(
+        "Importen svarade inte. Ladda om Min karta och försök igen.",
+        true
+      );
+    }, IMPORT_TIMEOUT_MS);
+  }
+
+  function clearRequestTimeout() {
+    if (requestTimeoutId !== null) {
+      window.clearTimeout(requestTimeoutId);
+      requestTimeoutId = null;
+    }
+  }
+
+  function finishRequest() {
+    clearRequestTimeout();
+    activeRequestId = null;
+    setImportBusy(false);
   }
 
   function listenForImportResults() {
@@ -310,7 +355,7 @@
       }
 
       if (
-        activeRequestId &&
+        !activeRequestId ||
         result.requestId !== activeRequestId
       ) {
         return;
@@ -318,23 +363,22 @@
 
       switch (result.action) {
         case "GPX_IMPORTED_AS_LINES":
-          activeRequestId = null;
-          setImportBusy(false);
+          finishRequest();
           setMainStatus(
             `Importerade ${result.lineCount} linjer · ` +
             `${Number(result.pointCount || 0).toLocaleString("sv-SE")} punkter.`
           );
 
-          window.setTimeout(() => {
-            document
-              .getElementById("mkgpx-refresh")
-              ?.click();
-          }, 100);
+          /*
+           * Min karta kan färdigbehandla drawend asynkront.
+           * Två uppdateringar gör att listan och namnen hinner med.
+           */
+          refreshLineListAfter(120);
+          refreshLineListAfter(650);
           break;
 
         case "GPX_IMPORT_ERROR":
-          activeRequestId = null;
-          setImportBusy(false);
+          finishRequest();
           setMainStatus(
             result.message ||
               "Kunde inte importera GPX-filen.",
@@ -343,6 +387,14 @@
           break;
       }
     });
+  }
+
+  function refreshLineListAfter(delay) {
+    window.setTimeout(() => {
+      document
+        .getElementById("mkgpx-refresh")
+        ?.click();
+    }, delay);
   }
 
   function setImportBusy(isBusy) {

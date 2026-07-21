@@ -10,8 +10,11 @@
   const COMMAND_EVENT = "MINKARTA_GPX_IMPORT_COMMAND";
   const RESULT_EVENT = "MINKARTA_GPX_IMPORT_RESULT";
   const OLD_OVERLAY_ID = "mkgpx-import-map-overlay";
+  const TARGET_PATH_STORAGE_KEY =
+    "minkarta-gpx-import-target-layer-path";
 
   let cachedMap = null;
+  let cachedTarget = null;
 
   removeOldCanvasOverlay();
 
@@ -49,13 +52,13 @@
       ? command.tracks
       : [];
 
-    const importSegments = [];
+    const rawSegments = [];
 
-    tracks.forEach((track, trackIndex) => {
-      const baseName =
+    tracks.forEach(track => {
+      const explicitName =
         typeof track.name === "string" && track.name.trim()
           ? track.name.trim()
-          : `Spår ${trackIndex + 1}`;
+          : null;
 
       const segments = Array.isArray(track.segments)
         ? track.segments
@@ -66,44 +69,59 @@
         .filter(segment => segment.length >= 2);
 
       convertedSegments.forEach((coordinates, segmentIndex) => {
-        const name =
-          convertedSegments.length > 1
-            ? `${baseName} – del ${segmentIndex + 1}`
-            : baseName;
-
-        importSegments.push({
-          name,
+        rawSegments.push({
+          requestedName:
+            explicitName && convertedSegments.length > 1
+              ? `${explicitName} – del ${segmentIndex + 1}`
+              : explicitName,
           coordinates
         });
       });
     });
 
-    if (importSegments.length === 0) {
+    if (rawSegments.length === 0) {
       throw new Error(
         "GPX-filen innehåller inga giltiga spår eller rutter."
       );
     }
 
-    const target = findBestLineTarget(map);
-    const importedFeatures = importSegments.map(segment =>
-      createImportedFeature(
-        target.templateFeature,
-        segment.name,
-        segment.coordinates
-      )
-    );
+    const usedNames = collectExistingLineNames(map);
+    const nextLineNumber = createLineNumberGenerator(usedNames);
 
-    if (typeof target.source.addFeatures === "function") {
-      target.source.addFeatures(importedFeatures);
-    } else {
-      importedFeatures.forEach(feature => {
-        target.source.addFeature(feature);
-      });
+    const importSegments = rawSegments.map(segment => ({
+      ...segment,
+      name: createUniqueLineName(
+        segment.requestedName,
+        usedNames,
+        nextLineNumber
+      )
+    }));
+
+    const context = findImportContext(map);
+    const importedFeatures = [];
+
+    for (const segment of importSegments) {
+      const feature = createIntegratedFeature(
+        context,
+        segment.name,
+        segment.coordinates,
+        map
+      );
+
+      importedFeatures.push(feature);
     }
 
-    target.source.changed?.();
-    target.layer.changed?.();
+    context.source?.changed?.();
+    context.layer?.changed?.();
     map.render?.();
+
+    /* Spara den riktiga målkällan även när första importen skapades via Draw. */
+    const discoveredTarget = findBestLineTarget(map);
+
+    if (discoveredTarget) {
+      cachedTarget = discoveredTarget;
+      rememberTargetPath(discoveredTarget.path);
+    }
 
     zoomToCoordinates(
       map,
@@ -114,11 +132,230 @@
       action: "GPX_IMPORTED_AS_LINES",
       requestId,
       lineCount: importedFeatures.length,
+      lineNames: importSegments.map(segment => segment.name),
       pointCount: importSegments.reduce(
         (total, segment) =>
           total + segment.coordinates.length,
         0
       )
+    });
+  }
+
+  function findImportContext(map) {
+    const currentTarget = findBestLineTarget(map);
+
+    if (currentTarget) {
+      cachedTarget = currentTarget;
+      rememberTargetPath(currentTarget.path);
+
+      return {
+        strategy: "clone",
+        ...currentTarget
+      };
+    }
+
+    if (isUsableCachedTarget(cachedTarget, map)) {
+      return {
+        strategy: "clone",
+        ...cachedTarget
+      };
+    }
+
+    const rememberedTarget = findRememberedTarget(map);
+    const drawInteraction = findLineDrawInteraction(
+      map,
+      rememberedTarget?.source ?? null
+    );
+
+    if (drawInteraction) {
+      return {
+        strategy: "draw",
+        interaction: drawInteraction.interaction,
+        source:
+          drawInteraction.source ??
+          rememberedTarget?.source ??
+          null,
+        layer: rememberedTarget?.layer ?? null,
+        path: rememberedTarget?.path ?? null
+      };
+    }
+
+    /*
+     * Om lagersökvägen är känd men draw-interaktionen inte kan hittas,
+     * kan en tidigare cachad template fortfarande användas under samma sida.
+     */
+    if (
+      rememberedTarget &&
+      cachedTarget?.templateFeature &&
+      typeof cachedTarget.templateFeature.clone === "function"
+    ) {
+      return {
+        strategy: "clone",
+        ...rememberedTarget,
+        templateFeature: cachedTarget.templateFeature
+      };
+    }
+
+    throw new Error(
+      "Kunde inte skapa en linje i Min karta. " +
+      "Öppna ritverktyget en gång eller rita en kort linje och försök igen."
+    );
+  }
+
+  function createIntegratedFeature(
+    context,
+    name,
+    coordinates,
+    map
+  ) {
+    if (context.strategy === "draw") {
+      return createWithDrawInteraction(
+        context.interaction,
+        name,
+        coordinates,
+        map
+      );
+    }
+
+    return createByCloningTemplate(
+      context,
+      name,
+      coordinates
+    );
+  }
+
+  function createWithDrawInteraction(
+    interaction,
+    name,
+    coordinates,
+    map
+  ) {
+    if (
+      typeof interaction?.appendCoordinates !== "function" ||
+      typeof interaction?.finishDrawing !== "function"
+    ) {
+      throw new Error(
+        "Min kartas ritverktyg kunde inte användas för importen."
+      );
+    }
+
+    interaction.abortDrawing?.();
+
+    interaction.appendCoordinates(
+      coordinates.map(coordinate => [
+        Number(coordinate[0]),
+        Number(coordinate[1])
+      ])
+    );
+
+    const feature = interaction.finishDrawing();
+
+    if (!feature || typeof feature.setGeometry !== "function") {
+      throw new Error(
+        "Min kartas ritverktyg skapade ingen linje."
+      );
+    }
+
+    applyImportedMetadata(feature, name);
+    clearClonedHighlightStyle(feature);
+    reapplyImportedName(feature, name);
+
+    map.render?.();
+    return feature;
+  }
+
+  function createByCloningTemplate(
+    context,
+    name,
+    coordinates
+  ) {
+    const templateFeature = context.templateFeature;
+
+    if (
+      !templateFeature ||
+      typeof templateFeature.clone !== "function"
+    ) {
+      throw new Error("Linjemallen saknas.");
+    }
+
+    const feature = templateFeature.clone();
+    const templateGeometry = templateFeature.getGeometry?.();
+    const geometry = templateGeometry?.clone?.();
+
+    if (!geometry || typeof geometry.setCoordinates !== "function") {
+      throw new Error("Linjemallens geometri kunde inte kopieras.");
+    }
+
+    geometry.setCoordinates(
+      coordinates.map(coordinate => [
+        Number(coordinate[0]),
+        Number(coordinate[1])
+      ])
+    );
+
+    feature.setGeometry(geometry);
+
+    /*
+     * templateFeature kan vara vald och ha en cyan direktstil.
+     * Den stilen ska inte följa med till den nya linjen.
+     */
+    clearClonedHighlightStyle(feature);
+    applyImportedMetadata(feature, name);
+
+    if (typeof feature.setId === "function") {
+      feature.setId(undefined);
+    }
+
+    context.source.addFeature(feature);
+    context.source.changed?.();
+    context.layer?.changed?.();
+
+    reapplyImportedName(feature, name);
+    feature.changed?.();
+
+    return feature;
+  }
+
+  function clearClonedHighlightStyle(feature) {
+    if (typeof feature?.setStyle === "function") {
+      feature.setStyle(undefined);
+    }
+  }
+
+  function applyImportedMetadata(feature, name) {
+    const properties = {
+      name,
+      title: name,
+      label: name,
+      minkartaGpxName: name,
+      minkartaGpxImported: true
+    };
+
+    if (typeof feature.setProperties === "function") {
+      feature.setProperties(properties, true);
+    } else {
+      Object.entries(properties).forEach(([key, value]) => {
+        feature.set?.(key, value, true);
+      });
+    }
+
+    feature.changed?.();
+  }
+
+  function reapplyImportedName(feature, name) {
+    /*
+     * Min karta kan sätta egna feature-egenskaper i drawend.
+     * Namnet återställs några gånger, men stilen lämnas orörd så
+     * vanlig cyan markering fortfarande fungerar när linjen väljs.
+     */
+    [0, 80, 300, 900].forEach(delay => {
+      window.setTimeout(() => {
+        if (!feature?.getGeometry?.()) {
+          return;
+        }
+
+        applyImportedMetadata(feature, name);
+      }, delay);
     });
   }
 
@@ -165,8 +402,11 @@
           layer,
           source,
           templateFeature: feature,
+          path,
+          map,
           score: scoreLineCandidate(
             layer,
+            source,
             feature,
             features.length,
             featureIndex,
@@ -177,19 +417,12 @@
     });
 
     candidates.sort((a, b) => b.score - a.score);
-
-    if (candidates.length === 0) {
-      throw new Error(
-        "Kunde inte hitta Min kartas linjelager. " +
-        "Rita en kort linje i kartan först och försök sedan importera igen."
-      );
-    }
-
-    return candidates[0];
+    return candidates[0] ?? null;
   }
 
   function scoreLineCandidate(
     layer,
+    source,
     feature,
     featureCount,
     featureIndex,
@@ -197,18 +430,14 @@
   ) {
     let score = 0;
 
-    const properties = feature.getProperties?.() ?? {};
-    const propertyNames = Object.keys(properties)
+    const searchableText = [
+      propertiesAsText(layer),
+      propertiesAsText(source),
+      propertiesAsText(feature),
+      path
+    ]
       .join(" ")
       .toLowerCase();
-
-    const propertyValues = Object.values(properties)
-      .filter(value => typeof value === "string")
-      .join(" ")
-      .toLowerCase();
-
-    const searchableText =
-      `${propertyNames} ${propertyValues} ${path}`;
 
     if (/measure|measurement|distance|length|mat|mät/.test(searchableText)) {
       score += 300;
@@ -223,7 +452,7 @@
     }
 
     if (feature.get?.("minkartaGpxImported") === true) {
-      score -= 100;
+      score -= 40;
     }
 
     if (layer.getVisible?.() !== false) {
@@ -245,44 +474,347 @@
     }
 
     score += Math.min(20, featureIndex);
-
     return score;
   }
 
-  function createImportedFeature(
-    templateFeature,
-    name,
-    coordinates
-  ) {
-    const feature = templateFeature.clone();
-    const templateGeometry = templateFeature.getGeometry?.();
-    const geometry = templateGeometry.clone();
+  function findLineDrawInteraction(map, preferredSource) {
+    const interactions =
+      map.getInteractions?.().getArray?.() ?? [];
 
-    geometry.setCoordinates(
-      coordinates.map(coordinate => [
-        Number(coordinate[0]),
-        Number(coordinate[1])
-      ])
-    );
+    const candidates = [];
 
-    feature.setGeometry(geometry);
-    feature.set?.("name", name);
-    feature.set?.("title", name);
-    feature.set?.("minkartaGpxImported", true);
+    interactions.forEach((interaction, index) => {
+      if (
+        typeof interaction?.appendCoordinates !== "function" ||
+        typeof interaction?.finishDrawing !== "function"
+      ) {
+        return;
+      }
 
-    if (typeof feature.setId === "function") {
-      feature.setId(undefined);
+      const source = getInteractionSource(interaction);
+      const text = interactionAsText(interaction).toLowerCase();
+      let score = 0;
+
+      if (/linestring|line string|line/.test(text)) {
+        score += 500;
+      }
+
+      if (/measure|distance|length|mat|mät/.test(text)) {
+        score += 250;
+      }
+
+      if (/draw|sketch|rit/.test(text)) {
+        score += 100;
+      }
+
+      if (/polygon|circle|point/.test(text)) {
+        score -= 600;
+      }
+
+      if (source && source === preferredSource) {
+        score += 1_000;
+      }
+
+      if (
+        source &&
+        typeof source.addFeature === "function"
+      ) {
+        score += 100;
+      }
+
+      if (interaction.getActive?.() === true) {
+        score += 25;
+      }
+
+      score -= index / 100;
+
+      /*
+       * Använd inte en okänd draw-interaktion om vi saknar både
+       * LineString-indikation och matchande källa.
+       */
+      if (
+        score < 400 &&
+        !(preferredSource && source === preferredSource)
+      ) {
+        return;
+      }
+
+      candidates.push({
+        interaction,
+        source,
+        score
+      });
+    });
+
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0] ?? null;
+  }
+
+  function getInteractionSource(interaction) {
+    const possibleSources = [
+      interaction.source_,
+      interaction.get?.("source"),
+      interaction.source,
+      interaction.getSource?.()
+    ];
+
+    return possibleSources.find(source =>
+      source && typeof source.addFeature === "function"
+    ) ?? null;
+  }
+
+  function interactionAsText(interaction) {
+    const values = [];
+
+    let keys;
+
+    try {
+      keys = Reflect.ownKeys(interaction);
+    } catch {
+      return "";
     }
 
-    feature.changed?.();
-    return feature;
+    for (const key of keys.slice(0, 250)) {
+      let value;
+
+      try {
+        value = interaction[key];
+      } catch {
+        continue;
+      }
+
+      if (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      ) {
+        values.push(`${String(key)} ${String(value)}`);
+      }
+    }
+
+    values.push(interaction.constructor?.name ?? "");
+    return values.join(" ");
+  }
+
+  function collectExistingLineNames(map) {
+    const names = new Set();
+
+    walkLayers(map, (_layer, source) => {
+      if (!source || typeof source.getFeatures !== "function") {
+        return;
+      }
+
+      let features;
+
+      try {
+        features = source.getFeatures();
+      } catch {
+        return;
+      }
+
+      for (const feature of features ?? []) {
+        const type = feature.getGeometry?.()?.getType?.();
+
+        if (
+          type !== "LineString" &&
+          type !== "MultiLineString"
+        ) {
+          continue;
+        }
+
+        const name = getKnownFeatureName(feature);
+
+        if (name) {
+          names.add(name);
+        }
+      }
+    });
+
+    return names;
+  }
+
+  function getKnownFeatureName(feature) {
+    const possibleNames = [
+      feature.get?.("minkartaGpxName"),
+      feature.get?.("name"),
+      feature.get?.("title"),
+      feature.get?.("label")
+    ];
+
+    const name = possibleNames.find(value =>
+      typeof value === "string" && value.trim()
+    );
+
+    return name?.trim() ?? null;
+  }
+
+  function createLineNumberGenerator(usedNames) {
+    let next = 1;
+
+    for (const name of usedNames) {
+      const match = /^Linje\s+(\d+)$/i.exec(name);
+
+      if (match) {
+        next = Math.max(next, Number(match[1]) + 1);
+      }
+    }
+
+    return () => {
+      while (usedNames.has(`Linje ${next}`)) {
+        next++;
+      }
+
+      const name = `Linje ${next}`;
+      next++;
+      return name;
+    };
+  }
+
+  function createUniqueLineName(
+    requestedName,
+    usedNames,
+    nextLineNumber
+  ) {
+    if (!requestedName) {
+      const generated = nextLineNumber();
+      usedNames.add(generated);
+      return generated;
+    }
+
+    const cleanName = requestedName.trim();
+
+    if (!usedNames.has(cleanName)) {
+      usedNames.add(cleanName);
+      return cleanName;
+    }
+
+    let duplicateNumber = 2;
+    let candidate = `${cleanName} (${duplicateNumber})`;
+
+    while (usedNames.has(candidate)) {
+      duplicateNumber++;
+      candidate = `${cleanName} (${duplicateNumber})`;
+    }
+
+    usedNames.add(candidate);
+    return candidate;
+  }
+
+  function rememberTargetPath(path) {
+    if (!path) {
+      return;
+    }
+
+    try {
+      window.sessionStorage.setItem(
+        TARGET_PATH_STORAGE_KEY,
+        path
+      );
+    } catch {
+      /* Lagring är bara en optimering. */
+    }
+  }
+
+  function findRememberedTarget(map) {
+    let path;
+
+    try {
+      path = window.sessionStorage.getItem(
+        TARGET_PATH_STORAGE_KEY
+      );
+    } catch {
+      return null;
+    }
+
+    if (!path) {
+      return null;
+    }
+
+    const layer = findLayerByPath(map, path);
+    const source = layer?.getSource?.();
+
+    if (
+      !source ||
+      typeof source.addFeature !== "function"
+    ) {
+      return null;
+    }
+
+    return {
+      map,
+      path,
+      layer,
+      source
+    };
+  }
+
+  function findLayerByPath(map, path) {
+    const indices = String(path)
+      .split("/")
+      .map(part => {
+        const match = /(?:layer-)?(\d+)$/.exec(part);
+        return match ? Number(match[1]) : NaN;
+      });
+
+    if (
+      indices.length === 0 ||
+      indices.some(index => !Number.isInteger(index))
+    ) {
+      return null;
+    }
+
+    let layers = getTopLevelLayers(map);
+    let layer = null;
+
+    for (const index of indices) {
+      layer = layers[index];
+
+      if (!layer) {
+        return null;
+      }
+
+      layers = layer.getLayers?.().getArray?.() ?? [];
+    }
+
+    return layer;
+  }
+
+  function isUsableCachedTarget(target, map) {
+    return Boolean(
+      target &&
+      target.map === map &&
+      target.source &&
+      typeof target.source.addFeature === "function" &&
+      target.templateFeature &&
+      typeof target.templateFeature.clone === "function"
+    );
+  }
+
+  function propertiesAsText(object) {
+    if (!object) {
+      return "";
+    }
+
+    let properties = {};
+
+    try {
+      properties = object.getProperties?.() ?? {};
+    } catch {
+      properties = {};
+    }
+
+    return Object.entries(properties)
+      .filter(([, value]) =>
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      )
+      .map(([key, value]) => `${key} ${String(value)}`)
+      .join(" ");
   }
 
   function walkLayers(map, visit) {
-    const rootLayers =
-      map.getLayers?.().getArray?.() ??
-      map.getLayerGroup?.().getLayers?.().getArray?.() ??
-      [];
+    const rootLayers = getTopLevelLayers(map);
 
     function inspect(layer, path) {
       if (!layer) {
@@ -306,6 +838,17 @@
     rootLayers.forEach((layer, index) => {
       inspect(layer, `layer-${index}`);
     });
+  }
+
+  function getTopLevelLayers(map) {
+    return (
+      map.getLayers?.().getArray?.() ??
+      map
+        .getLayerGroup?.()
+        .getLayers?.()
+        .getArray?.() ??
+      []
+    );
   }
 
   function convertSegment(segment) {
@@ -661,6 +1204,6 @@
   }
 
   console.log(
-    "[Min karta GPX] Integrerad GPX-import är laddad."
+    "[Min karta GPX] Integrerad GPX-import v0.4 är laddad."
   );
 })();
